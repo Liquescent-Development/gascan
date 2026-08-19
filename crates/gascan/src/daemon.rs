@@ -463,8 +463,22 @@ pub(crate) struct Inspection<C> {
     published_record: Option<InterruptedTombstone>,
     /// Set when this observation failed because the path moved under it rather
     /// than because it found something wrong. `retry_while_raced` looks again on
-    /// it; nothing else reads it.
+    /// it, and carries it out on the verdict it gives up with, which is the only
+    /// way it reaches anything else: `ensure_started_locked`'s readiness loop
+    /// polls on that verdict instead of failing on it.
     raced: Option<String>,
+}
+
+/// What an inspection looks at: `inspect_with`'s four parameters as one value.
+///
+/// `ensure_started_locked` forwards all four unchanged on every poll and never
+/// varies them, so it carries them together rather than as four positional
+/// arguments beside the ones it does decide.
+struct InspectionSubject<'a, E, P> {
+    paths: &'a DaemonPaths,
+    expected_executable: &'a Path,
+    endpoint: &'a E,
+    inspector: &'a P,
 }
 
 impl<C> Inspection<C> {
@@ -1095,20 +1109,27 @@ where
         }
     }
     let detail = last_race.unwrap_or_else(|| "the daemon record kept changing".to_owned());
+    // The marker stays on the verdict this loop gives up with, and that is what
+    // makes "never settled" legible to a caller with budget this loop does not
+    // have: `ensure_started_locked`'s readiness loop matches on it rather than
+    // on the message below, which carries a runtime observation count. It
+    // cannot make this verdict retryable here -- it is built after the loop and
+    // never passed to `observe`, and `inspect_with_hook` is the only caller, so
+    // no `retry_while_raced` ever reads it.
+    let status_detail =
+        format!("the daemon record was still changing after {observations} observations: {detail}");
     Ok(Inspection {
         status: DaemonStatus {
             state: DaemonState::Unsafe,
             identity: None,
             legacy: false,
-            detail: Some(format!(
-                "the daemon record was still changing after {observations} observations: {detail}"
-            )),
+            detail: Some(status_detail),
         },
         session: None,
         record: None,
         interrupted_tombstone: None,
         published_record: None,
-        raced: None,
+        raced: Some(detail),
     })
 }
 
@@ -1355,13 +1376,53 @@ async fn ensure_started_locked<E, P, S>(
     inspector: &P,
     spawner: &S,
     timeouts: SupervisorTimeouts,
-    mut inspected: Inspection<E::Connection>,
+    inspected: Inspection<E::Connection>,
 ) -> Result<(Inspection<E::Connection>, bool), SupervisorError>
 where
     E: DaemonEndpoint,
     P: ProcessInspector,
     S: DaemonSpawner,
 {
+    ensure_started_locked_with_hook(
+        InspectionSubject {
+            paths,
+            expected_executable,
+            endpoint,
+            inspector,
+        },
+        spawner,
+        timeouts,
+        inspected,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Readiness with the record read's tombstone window exposed on every poll.
+///
+/// The hook goes to `inspect_with_hook` rather than `inspect_with` so that a
+/// test can hold the path in a raced state across the whole loop, which is the
+/// only way the never-settled verdict reaches this loop without a second thread
+/// and a clock. `Fn`, because the loop rebuilds the inspection on every poll.
+async fn ensure_started_locked_with_hook<E, P, S, F>(
+    subject: InspectionSubject<'_, E, P>,
+    spawner: &S,
+    timeouts: SupervisorTimeouts,
+    mut inspected: Inspection<E::Connection>,
+    before_tombstone_validation: F,
+) -> Result<(Inspection<E::Connection>, bool), SupervisorError>
+where
+    E: DaemonEndpoint,
+    P: ProcessInspector,
+    S: DaemonSpawner,
+    F: Fn() -> io::Result<()>,
+{
+    let InspectionSubject {
+        paths,
+        expected_executable,
+        endpoint,
+        inspector,
+    } = subject;
     if inspected.status.state == DaemonState::Unsafe
         && inspected.session.is_none()
         && let Some(tombstone) = inspected.interrupted_tombstone.take()
@@ -1421,7 +1482,13 @@ where
     loop {
         let inspected = match tokio::time::timeout_at(
             deadline,
-            inspect_with(paths, expected_executable, endpoint, inspector),
+            inspect_with_hook(
+                paths,
+                expected_executable,
+                endpoint,
+                inspector,
+                &before_tombstone_validation,
+            ),
         )
         .await
         {
@@ -1495,6 +1562,23 @@ where
             DaemonState::Unsafe
                 if inspected.status.detail.as_deref() == Some(ENDPOINT_CHANGED_DURING_PROBE)
                     && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + timeouts.poll,
+                ))
+                .await;
+            }
+            // `retry_while_raced` gives up after three observations because it
+            // has no budget of its own. This caller has one, and the state the
+            // give-up verdict reports -- a path that is still moving -- is the
+            // definition of a transient one, so failing on it here spends none
+            // of the readiness deadline. Matched on the marker rather than on
+            // the verdict's message, which is formatted with a runtime
+            // observation count; the arm above matches a message because
+            // `ENDPOINT_CHANGED_DURING_PROBE` is a constant and this is not.
+            DaemonState::Unsafe
+                if inspected.raced.is_some() && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep_until(std::cmp::min(
                     deadline,
@@ -4056,15 +4140,15 @@ mod tests {
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
         DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
         DaemonStartupMonitor, DaemonState, DaemonStatus, DaemonTransition, EndpointPathState,
-        EndpointProbe, EndpointSession, INSTANCE_TOMBSTONE_MODE, Inspection, InstanceTimestamp,
-        MAX_STARTUP_DIAGNOSTIC_BYTES, OsProcessInspector, PRIVATE_FILE_MODE, ProcessIdentity,
-        ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode, SupervisorError,
-        SupervisorTimeouts, checked_pid, coherent_process_identity,
-        connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
-        inspect_with_hook, is_raced, observe_once_with_hook, open_interrupted_tombstone,
-        open_published_record, race_marker, raced, read_attested_instance,
-        read_instance_record_with_hook, restart_with, retire_held_record,
-        retire_held_record_with_hook, retry_while_raced, signal_attested_with,
+        EndpointProbe, EndpointSession, INSTANCE_TOMBSTONE_MODE, Inspection, InspectionSubject,
+        InstanceTimestamp, MAX_STARTUP_DIAGNOSTIC_BYTES, OsProcessInspector, PRIVATE_FILE_MODE,
+        ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
+        SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
+        connect_current_or_recover_with, connect_current_or_recover_with_observer,
+        ensure_started_locked_with_hook, inspect_with, inspect_with_hook, is_raced,
+        observe_once_with_hook, open_interrupted_tombstone, open_published_record, race_marker,
+        raced, read_attested_instance, read_instance_record_with_hook, restart_with,
+        retire_held_record, retire_held_record_with_hook, retry_while_raced, signal_attested_with,
         signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
@@ -8638,6 +8722,97 @@ mod tests {
             observations.load(AtomicOrdering::SeqCst),
             3,
             "every observation is spent before the reader gives up"
+        );
+        Ok(())
+    }
+
+    /// A spawner that starts nothing, so the readiness loop is left with only
+    /// what the test puts at the instance path.
+    #[derive(Default)]
+    struct SilentSpawner {
+        launches: AtomicUsize,
+    }
+
+    impl DaemonSpawner for SilentSpawner {
+        fn spawn(&self, _launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor> {
+            self.launches.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(DaemonStartupMonitor::default())
+        }
+    }
+
+    /// `retry_while_raced` gives up after three observations because it has no
+    /// budget of its own; readiness has fifteen seconds of one. A path that is
+    /// still moving is transient by definition, so this caller must spend its
+    /// deadline on it rather than return the give-up verdict as a terminal
+    /// `Readiness` failure with the whole budget unspent.
+    ///
+    /// Every observation is raced by hand: `before_tombstone_validation` renames
+    /// a fresh inert tombstone over the name after the reader has stat'd it and
+    /// before the validator opens what it stat'd, so no clock decides anything.
+    /// Time is paused, so the deadline and the polls are virtual and the loop
+    /// ends where the test says it does rather than where the machine's load
+    /// puts it. The readiness bound has to exceed one inspection, and one
+    /// inspection sleeps twice for `DEFAULT_POLL` inside `retry_while_raced`,
+    /// which `timeouts.poll` does not reach.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_settled_inspection_is_polled_against_the_readiness_deadline() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        paths.prepare_directory()?;
+        write_inert_tombstone(paths.instance(), u32::from(INSTANCE_TOMBSTONE_MODE))?;
+
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        let spawner = SilentSpawner::default();
+        let observations = AtomicUsize::new(0);
+        let instance = paths.instance().to_owned();
+
+        let result = ensure_started_locked_with_hook(
+            InspectionSubject {
+                paths: &paths,
+                expected_executable: &executable,
+                endpoint: &endpoint,
+                inspector: &inspector,
+            },
+            &spawner,
+            SupervisorTimeouts {
+                readiness: Duration::from_secs(1),
+                shutdown: Duration::from_millis(25),
+                poll: Duration::from_millis(10),
+            },
+            settled_observation(),
+            || {
+                let index = observations.fetch_add(1, AtomicOrdering::SeqCst);
+                let staged = instance.with_extension(format!("staged-{index}"));
+                write_inert_tombstone(&staged, u32::from(INSTANCE_TOMBSTONE_MODE))?;
+                fs::rename(&staged, &instance)
+            },
+        )
+        .await;
+
+        match &result {
+            Err(SupervisorError::Readiness {
+                state: DaemonState::Unreachable,
+                detail: Some(detail),
+            }) => assert_eq!(
+                detail, "daemon readiness deadline elapsed during state inspection",
+                "readiness ended on something other than its own deadline"
+            ),
+            other => {
+                return Err(format!(
+                    "a never-settled path must be polled to the deadline, not failed at once: \
+                     {other:?}"
+                )
+                .into());
+            }
+        }
+        // Three observations are one inspection. More than three is the loop
+        // having come back for a second one, which is the whole fix.
+        assert!(
+            observations.load(AtomicOrdering::SeqCst) > 3,
+            "the loop gave up after a single inspection: {} observations",
+            observations.load(AtomicOrdering::SeqCst)
         );
         Ok(())
     }
