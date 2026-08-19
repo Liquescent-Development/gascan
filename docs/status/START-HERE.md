@@ -2830,8 +2830,9 @@ cannot have caused it, and that is a proof rather than an estimate. It was empty
 
 **The standing rule: a green local `cargo test --workspace` is the bar. CI reports but
 must not gate, and flake-chasing waits** until someone is asked to do it. There are at
-least four distinct root causes to fix when that day comes — the PTY wall-clock bound,
-D7's `0200` window, the keygen `/dev/fd` descriptor, and the empty pid file below.
+least five distinct root causes to fix when that day comes — the PTY wall-clock bound,
+D7's `0200` window, the keygen `/dev/fd` descriptor, the empty pid file below, and the
+reconcile phase matrix below that.
 
 **THE FOURTH MECHANISM, FOUND 2026-08-19 AND NOT FIXED: the e2e harness reads the pid file
 while it is empty.** `doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` failed
@@ -2853,6 +2854,28 @@ doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` passed **4 runs
 **Candidate cure, not built:** gate on the pid file being non-empty, or have the daemon write
 it via a staged rename — the discipline the instance record gained in `025b922`, applied to a
 file the tests depend on.
+
+**THE FIFTH MECHANISM, FOUND 2026-08-19 AND NOT DIAGNOSED: `main` is red on the reconcile
+phase matrix, and it is not a branch's doing.** The `rust` job fails with
+`provision_and_health_kill_point_phase_matrix_has_exact_recovery_status` panicking at
+`crates/gascand/tests/reconcile.rs:965:9`, `assertion left == right failed: during-health,
+left: Completed, right: Failed`. That is CI run `32266053978` on
+`fix/daemon-reader-retryable-verdict` at `a902fd5` — and it is **not that branch's**: run
+`32214820420` is on `main` at `61f1b3c`, which is that branch's own merge-base
+(`git merge-base main fix/daemon-reader-retryable-verdict` → `61f1b3c64b10dec`), and it
+failed on the same test at the same line with the same two values, `27 passed; 1 failed`.
+So `main` itself is red for this reason, independent of any branch.
+
+Exonerated by diff and by isolation: `git diff --stat 61f1b3c...fix/daemon-reader-retryable-verdict
+-- crates/gascand/tests/reconcile.rs` is empty, and locally on
+`fix/daemon-reader-retryable-verdict`
+`cargo test -p gascand --test reconcile
+provision_and_health_kill_point_phase_matrix_has_exact_recovery_status` passed **12 runs
+out of 12** and the full `cargo test -p gascand --test reconcile` passed **3 runs out of 3**
+(28 passed, 0 failed each time). **The mechanism is not known.** `Completed` where `Failed`
+is expected means a kill during the health phase left an operation looking successful, which
+is a description of the assertion and not a diagnosis; nobody has traced it. Do not repeat a
+guess about it as a finding.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
