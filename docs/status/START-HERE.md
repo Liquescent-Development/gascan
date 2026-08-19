@@ -209,7 +209,7 @@ this constant.** Two of the four were the startup diagnostic's name and go throu
 `STARTUP_DIAGNOSTIC_NAME`; the other two were the instance record's name and go through
 `gascan_core::daemon_protocol::INSTANCE_NAME`. VERIFIED at the pre-item-9 base:
 `git grep -c daemon-startup-error 3cf98b5 -- crates/gascan/src/client.rs` returns 2, and the
-same command for `daemon-instance` returns 2. Both pairs sit in the two `DaemonPaths`-building
+same command for `daemon-instance` returns 2. Both pairs sit in the two `DaemonLaunch`-building
 blocks in that file; grep for the two constant names rather than trusting a line number.
 
 `INSTANCE_STAGING_PURPOSE` was left in `socket.rs` by item 9 on the argument that `gascand` was
