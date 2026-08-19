@@ -479,6 +479,38 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    one-line delegation to call `observe_once_with_hook` directly gives **308 passed, 0 failed**:
    that mutation is not caught. It is the residual every `_with_hook` pair in this file carries.
    The one failing test in each caught run is the new one, so the collapse is silent without it.
+   **A test is not the only way to close it, and it is not the cheapest.** An independent review
+   of PR #87 on 2026-08-19 pointed out that moving `retry_while_raced` and
+   `observe_once_with_hook` into a private submodule that exports only `inspect_with_hook` turns
+   bypassing the retry into a **compile error** rather than a silently-green mutation, at zero
+   cost to `inspect_with`'s callers. Rust's module privacy is the tool for "this function has
+   exactly one legitimate caller", and `inspect_with_hook` is that shape. Prefer it to threading
+   a hook parameter outward.
+
+   **FIVE MINORS FROM THAT SAME REVIEW, RECORDED UNFIXED.** The two Importants it raised are
+   fixed on this branch; these four are not, and the fifth is the module-privacy remedy above.
+   Locations are function names on purpose — line numbers in this file have gone stale within
+   hours.
+
+   - **`stage_inert_reclaim_file` (`crates/gascan/src/daemon.rs`) omits the check its stated
+     mirror performs.** Its doc comment claims it shares the recipe "create exclusive, `fchmod`,
+     then verify rather than assume" with `stage_inert_instance_file`
+     (`crates/gascand/src/socket.rs`). `gascand` verifies both the descriptor and that the
+     staging *name* still resolves to the inode it opened; `gascan` verifies only the descriptor.
+     Either close the gap or stop claiming the mirror.
+   - **`DEFAULT_POLL` unifies the value and severs the knob.** `inspect_with_hook` passes the
+     constant to `retry_while_raced`, so the retry delay is the one poll in the supervisor that a
+     caller's `SupervisorTimeouts::poll` cannot reach.
+   - **A terminal endpoint fault's detail is discarded by the give-up path.** On
+     `observe_once_with_hook`'s `EndpointProbe::Unsafe` arm the detail composes a genuinely
+     terminal endpoint fault with the record race; `retry_while_raced`'s give-up verdict carries
+     only the race detail, so the actionable half is lost. The verdict stays `Unsafe`, so nothing
+     unsafe follows from it.
+   - **Two defensive branches are unverified, not covered**: `empty_unlinked_inode`'s
+     `st_nlink != 0` refusal, and `validate_retired_tombstone`'s "the staged tombstone changed
+     while it was being renamed into place" check. Both are unreachable by construction on every
+     path the review could trace, which is why it did not ask for tests. If either is ever
+     reported in the field it will be the first time it has run.
 
 2. **(2c) THE DAEMON'S PRODUCTION LOG IS DECIDED AND UNBUILT. DO NOT RE-OPEN THE DECISION.**
    The maintainer ruled on 2026-08-18: **daemon-level events only, redacted.** Start, stop and
