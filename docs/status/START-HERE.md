@@ -226,6 +226,11 @@ prescribes: `git diff 3cf98b5..HEAD -- crates/gascan-e2e/` is **empty**, so the 
 have caused it; and the test passes alone 5 of 5, in 0.40-0.55s against a 2s bound. The test
 spawns `sh` and `dd` and touches no daemon-protocol path at all.
 
+**THE RE-RUN AT `1a8d33c` WAS GREEN ON EVERYTHING** — `changes`, `contracts`, `rust` and
+`gate` all passed, `engine` skipped, run `32206399534`, with `mergeable=MERGEABLE
+mergeStateStatus=CLEAN`. The same tree, the same tests: that is what the flake looks like from
+the other side, and it is why a single red `rust` is not evidence about a branch.
+
 **A CLAIM IN THIS FILE AND IN `a493cb8`'s COMMIT MESSAGE WAS WRONG AND IS CORRECTED HERE.**
 Both said `scripts/ci-classify-paths.sh` returns `contracts=false` and that `rust` was the only
 job the diff triggers. That was measured on the **code-only** diff, before the docs commit
