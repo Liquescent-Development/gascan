@@ -3,6 +3,10 @@
     reason = "Task 5 management entry points are consumed by the Task 6 CLI commands"
 )]
 
+use gascan_core::daemon_protocol::{
+    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_TOMBSTONE_MODE, LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE,
+    SOCKET_NAME,
+};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
 use serde::{Deserialize, Serialize};
@@ -13,13 +17,12 @@ use std::os::unix::fs::FileExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const DIRECTORY_MODE: u16 = 0o700;
-const FILE_MODE: u16 = 0o600;
-const INSTANCE_TOMBSTONE_MODE: u16 = 0o200;
-const SOCKET_NAME: &str = "gascand.sock";
-const INSTANCE_NAME: &str = "daemon-instance.json";
-const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
-const STARTUP_DIAGNOSTIC_NAME: &str = "daemon-startup-error.json";
+/// The daemon's startup diagnostic, relative to the runtime directory. This one
+/// is `gascan`'s alone -- `gascand` reaches it by inherited descriptor and never
+/// by name -- so it is not part of the shared protocol and must not join it.
+/// `pub(crate)` only so that `client.rs`'s fixtures name it through this
+/// constant rather than through a literal of their own.
+pub(crate) const STARTUP_DIAGNOSTIC_NAME: &str = "daemon-startup-error.json";
 const MAX_INSTANCE_BYTES: u64 = 64 * 1024;
 const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const ENDPOINT_CHANGED_DURING_PROBE: &str =
@@ -527,7 +530,7 @@ impl DaemonStartupMonitor {
         let metadata = source.file.metadata()?;
         if !metadata.file_type().is_file()
             || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.permissions().mode() & 0o777 != u32::from(FILE_MODE)
+            || metadata.permissions().mode() & 0o777 != u32::from(PRIVATE_FILE_MODE)
             || metadata.nlink() != 0
             || metadata.len() > MAX_STARTUP_DIAGNOSTIC_BYTES as u64
         {
@@ -2940,7 +2943,7 @@ fn inspect_endpoint_path(paths: &DaemonPaths) -> io::Result<EndpointPathState> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::Socket
         || stat.st_uid != paths.expected_uid
         || stat.st_nlink != 1
-        || Mode::from_raw_mode(stat.st_mode).bits() & 0o777 != FILE_MODE
+        || Mode::from_raw_mode(stat.st_mode).bits() & 0o777 != PRIVATE_FILE_MODE
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -3113,10 +3116,10 @@ fn open_lock(directory: &OwnedFd, expected_uid: u32) -> io::Result<OwnedFd> {
         directory,
         LIFECYCLE_LOCK_NAME,
         OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(FILE_MODE),
+        Mode::from_raw_mode(PRIVATE_FILE_MODE),
     ) {
         Ok(fd) => {
-            rustix::fs::fchmod(&fd, Mode::from_raw_mode(FILE_MODE)).map_err(errno)?;
+            rustix::fs::fchmod(&fd, Mode::from_raw_mode(PRIVATE_FILE_MODE)).map_err(errno)?;
             Ok(fd)
         }
         Err(error) if error == rustix::io::Errno::EXIST => rustix::fs::openat(
@@ -3235,7 +3238,7 @@ fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> io::Result<
         "mode is 0200 and the file is empty: not yet published"
     } else if mode == INSTANCE_TOMBSTONE_MODE {
         "mode is 0200 and the file has content: written but never published"
-    } else if mode != FILE_MODE {
+    } else if mode != PRIVATE_FILE_MODE {
         "mode is not 0600"
     } else {
         return Ok(());

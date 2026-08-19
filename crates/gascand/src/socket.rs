@@ -1,4 +1,8 @@
 use base64::Engine as _;
+use gascan_core::daemon_protocol::{
+    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_TOMBSTONE_MODE, LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE,
+    SOCKET_NAME,
+};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::geteuid;
@@ -11,13 +15,21 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const DIRECTORY_MODE: u16 = 0o700;
-const SOCKET_MODE: u16 = 0o600;
-const INSTANCE_TOMBSTONE_MODE: u16 = 0o200;
+// Two of the shared values are also stated in the published API surface --
+// `gascan_proto::SOCKET_DIRECTORY_MODE` and `gascan_proto::SOCKET_MODE` --
+// where `crates/gascan-proto/tests/api_compatibility.rs` pins them as the
+// contract a client checks the daemon's directory and socket against. That
+// copy cannot move here, because deleting it would change the published
+// surface, so it is bound to the implementation instead: if the mode this
+// file actually sets ever stops matching the mode the API promises, the build
+// fails rather than the client.
+const _: () = assert!(DIRECTORY_MODE as u32 == gascan_proto::SOCKET_DIRECTORY_MODE);
+const _: () = assert!(PRIVATE_FILE_MODE as u32 == gascan_proto::SOCKET_MODE);
+
+/// The staging prefix the sweeper matches. This one is `gascand`'s alone: no
+/// reader ever sees a staged file by name, so it is not part of the shared
+/// protocol and must not join it.
 const INSTANCE_STAGING_PURPOSE: &str = "instance";
-const SOCKET_NAME: &str = "gascand.sock";
-const INSTANCE_NAME: &str = "daemon-instance.json";
-const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
 static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,7 +98,7 @@ impl SocketPaths {
         rustix::fs::chmodat(
             &directory,
             staging.as_str(),
-            Mode::from_raw_mode(SOCKET_MODE),
+            Mode::from_raw_mode(PRIVATE_FILE_MODE),
             AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(errno)?;
@@ -407,7 +419,7 @@ where
     let publication = (|| {
         file.write_all(contents)?;
         file.sync_all()?;
-        rustix::fs::fchmod(&file, Mode::from_raw_mode(SOCKET_MODE)).map_err(errno)?;
+        rustix::fs::fchmod(&file, Mode::from_raw_mode(PRIVATE_FILE_MODE)).map_err(errno)?;
         let published = rustix::fs::fstat(&file).map_err(errno)?;
         validate_regular_file(&published)?;
         if identity_at(&directory, staging.as_str())? != identity {
@@ -549,7 +561,7 @@ fn validate_regular_file(stat: &rustix::fs::Stat) -> io::Result<()> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || stat.st_uid != geteuid().as_raw()
         || stat.st_nlink != 1
-        || Mode::from_raw_mode(stat.st_mode).bits() & 0o777 != SOCKET_MODE
+        || Mode::from_raw_mode(stat.st_mode).bits() & 0o777 != PRIVATE_FILE_MODE
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
