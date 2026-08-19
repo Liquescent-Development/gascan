@@ -2830,8 +2830,29 @@ cannot have caused it, and that is a proof rather than an estimate. It was empty
 
 **The standing rule: a green local `cargo test --workspace` is the bar. CI reports but
 must not gate, and flake-chasing waits** until someone is asked to do it. There are at
-least three distinct root causes to fix when that day comes — the PTY wall-clock bound,
-D7's `0200` window, and the keygen `/dev/fd` descriptor.
+least four distinct root causes to fix when that day comes — the PTY wall-clock bound,
+D7's `0200` window, the keygen `/dev/fd` descriptor, and the empty pid file below.
+
+**THE FOURTH MECHANISM, FOUND 2026-08-19 AND NOT FIXED: the e2e harness reads the pid file
+while it is empty.** `doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` failed
+a local `cargo test --workspace` on `fix/daemon-reader-retryable-verdict` with `Error:
+ParseIntError { kind: Empty }`. The mechanism is three lines, all read from the tree:
+`crates/gascand/src/api.rs:504` writes the pid with `std::fs::write(pid_path,
+std::process::id().to_string())?`, a create-truncate followed by a write;
+`wait_for_socket` at `crates/gascan-e2e/tests/doctor.rs:263` gates readiness on
+`pid.exists()` alone; and `UpgradeEnvironment::pid` at
+`crates/gascan-e2e/tests/doctor.rs:346-349` does `read_to_string(...).trim().parse()`. A read
+that lands between the create and the write sees a file that exists and is empty, which is
+that error exactly. A fixture-startup race in the e2e harness, widened by load — **NOT
+mechanism 1**, the `ssh-keygen` `/dev/fd` descriptor flake, which fails with `Bad file
+descriptor` out of `gascand`'s `apply_setup`.
+
+Exonerated by diff and by isolation: `fix/daemon-reader-retryable-verdict` touches no file
+under `crates/gascan-e2e/`, and `cargo test -p gascan-e2e --test doctor
+doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` passed **4 runs out of 4**.
+**Candidate cure, not built:** gate on the pid file being non-empty, or have the daemon write
+it via a staged rename — the discipline the instance record gained in `025b922`, applied to a
+file the tests depend on.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
