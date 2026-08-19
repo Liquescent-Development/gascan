@@ -3,9 +3,10 @@
     reason = "Task 5 management entry points are consumed by the Task 6 CLI commands"
 )]
 
+use base64::Engine as _;
 use gascan_core::daemon_protocol::{
     DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_TOMBSTONE_MODE, LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE,
-    SOCKET_NAME,
+    RECLAIM_STAGING_PURPOSE, SOCKET_NAME,
 };
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
@@ -1453,12 +1454,126 @@ async fn prove_endpoint_absent_or_inert<E: DaemonEndpoint>(
     }
 }
 
+/// The inert file retirement builds its next state in: created under a private
+/// name nobody is watching, `0200` and empty before it exists to anyone else,
+/// and unlinked again unless the caller renames it into place.
+///
+/// This mirrors `stage_inert_instance_file` in `crates/gascand/src/socket.rs`.
+/// The two are separate because they live in different crates and stage under
+/// different prefixes; the recipe they share -- create exclusive, `fchmod`,
+/// then verify rather than assume -- is the part that matters.
+///
+/// Nothing is ever written into this file. `sweep_abandoned_staging` in
+/// `crates/gascand/src/socket.rs` reasons from that: an abandoned `.reclaim-`
+/// file leaks no owner token, unlike `gascand`'s own staging, which holds a
+/// complete record. Writing content here would falsify that argument.
+fn stage_inert_reclaim_file(
+    directory: &OwnedFd,
+    expected_uid: u32,
+) -> Result<(File, String, FileIdentity), SupervisorError> {
+    let staging = reclaim_staging_name()?;
+    let fd = rustix::fs::openat(
+        directory,
+        staging.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE),
+    )
+    .map_err(errno)?;
+    let file = File::from(fd);
+    let staged = (|| {
+        // `openat`'s mode argument is masked by the umask, so the file is only
+        // known to be inert after an explicit `fchmod`.
+        rustix::fs::fchmod(&file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE)).map_err(errno)?;
+        let stat = rustix::fs::fstat(&file).map_err(errno)?;
+        if !is_instance_tombstone(&stat, expected_uid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reclaim staging file is not an inert private file",
+            ));
+        }
+        Ok(FileIdentity {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+        })
+    })();
+    match staged {
+        Ok(identity) => Ok((file, staging, identity)),
+        Err(error) => {
+            let _ = rustix::fs::unlinkat(directory, staging.as_str(), AtFlags::empty());
+            Err(SupervisorError::Io(error))
+        }
+    }
+}
+
+fn reclaim_staging_name() -> Result<String, SupervisorError> {
+    let mut bytes = [0_u8; 7];
+    getrandom::fill(&mut bytes).map_err(|error| SupervisorError::Io(io::Error::other(error)))?;
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    Ok(format!(".{RECLAIM_STAGING_PURPOSE}-{token}"))
+}
+
+/// Retire a record this process has proven dead: put a legal inert tombstone at
+/// the destination, and destroy the dead record's bytes.
+///
+/// **The order is forced, and it is the mirror image of the publisher's.**
+/// `crates/gascand/src/socket.rs` truncates before it chmods, because `lstat`
+/// tears between resolving a name and reading an inode and the torn read must
+/// not be `(0200, content)`. Here the destructive step comes *after* the
+/// rename for the same underlying reason: an inode is only safe to mutate
+/// destructively once it is out of the namespace. Truncating first would put
+/// `(0600, 0)` at the live name, and `validate_file_stat` accepts that as a
+/// published record of size zero -- the reader would take it and then fail
+/// parsing an empty file, which is a worse failure than the one this fixes.
+///
+/// A rename alone is not enough either. It leaves the old inode alive and
+/// unlinked with its content intact, reachable by any descriptor that outlives
+/// this process, and that content is what holds the owner token.
 fn retire_held_record(record: &InterruptedTombstone) -> Result<(), SupervisorError> {
-    rustix::fs::fchmod(&record.file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE))
-        .map_err(errno)?;
-    rustix::fs::ftruncate(&record.file, 0).map_err(errno)?;
-    record.file.sync_all()?;
-    validate_retired_tombstone(record)?;
+    let (staged, staging, staged_identity) =
+        stage_inert_reclaim_file(&record.directory, record.expected_uid)?;
+    staged.sync_all()?;
+    if let Err(error) = rustix::fs::renameat(
+        &record.directory,
+        staging.as_str(),
+        &record.directory,
+        record.name.as_os_str(),
+    ) {
+        let _ = rustix::fs::unlinkat(&record.directory, staging.as_str(), AtFlags::empty());
+        return Err(SupervisorError::Io(errno(error)));
+    }
+    // The rename unlinked the record, so nothing can reach it by name and
+    // emptying it is invisible at the path.
+    empty_unlinked_inode(&record.file)?;
+    validate_retired_tombstone(record, &staged, staged_identity)?;
+    Ok(())
+}
+
+/// Destroy an inode's bytes, refusing unless it is already out of the
+/// namespace.
+///
+/// The check and the truncation are one function because the ordering they
+/// enforce cannot be enforced by the tests above. Every assertion in
+/// `retire_held_record`'s tests reads the end state, and the end state is
+/// identical whether the truncation happens before or after the rename --
+/// MEASURED by hoisting the truncation above the rename and re-running
+/// `cargo test -p gascan --lib -- tombstone_recovery_ stale_record_recovery_
+/// retirement_replaces`: 8 passed, 0 failed. The difference is only visible to
+/// a concurrent reader during the window, which no test in this tree opens. So
+/// the precondition is checked at the moment it matters, and travels with the
+/// syscall it guards rather than sitting beside it where a later edit can
+/// separate them.
+fn empty_unlinked_inode(file: &File) -> Result<(), SupervisorError> {
+    let stat = rustix::fs::fstat(file).map_err(errno)?;
+    if stat.st_nlink != 0 {
+        return Err(SupervisorError::TombstoneChanged {
+            detail: format!(
+                "refusing to empty a record that is still reachable by name (links {})",
+                stat.st_nlink
+            ),
+        });
+    }
+    rustix::fs::ftruncate(file, 0).map_err(errno)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -1550,33 +1665,52 @@ fn validate_held_published_record(
     Ok(())
 }
 
-fn validate_retired_tombstone(tombstone: &InterruptedTombstone) -> Result<(), SupervisorError> {
-    let stat = rustix::fs::fstat(&tombstone.file).map_err(errno)?;
-    let identity = FileIdentity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino,
-    };
-    if !is_instance_tombstone(&stat, tombstone.expected_uid) || identity != tombstone.identity {
+/// Prove the retirement reached its two ends. The old form asserted one inode
+/// was still at the name; a rename unlinks it, so that is now unsatisfiable by
+/// construction. The replacement is strictly stronger: it proves the record is
+/// gone from the namespace, that its bytes are destroyed, and that what stands
+/// in its place is legal.
+fn validate_retired_tombstone(
+    record: &InterruptedTombstone,
+    staged: &File,
+    staged_identity: FileIdentity,
+) -> Result<(), SupervisorError> {
+    let held = rustix::fs::fstat(&record.file).map_err(errno)?;
+    if held.st_nlink != 0 || held.st_size != 0 {
         return Err(SupervisorError::TombstoneChanged {
-            detail: "held descriptor did not reach the exact empty tombstone state".to_owned(),
+            detail: format!(
+                "the retired record is still reachable or still holds content (links {}, size {})",
+                held.st_nlink, held.st_size
+            ),
         });
     }
-    let path = rustix::fs::statat(
-        &tombstone.directory,
-        tombstone.name.as_os_str(),
+    let at_name = rustix::fs::statat(
+        &record.directory,
+        record.name.as_os_str(),
         AtFlags::SYMLINK_NOFOLLOW,
     )
     .map_err(|error| SupervisorError::TombstoneChanged {
         detail: errno(error).to_string(),
     })?;
-    let path_identity = FileIdentity {
-        device: path.st_dev as u64,
-        inode: path.st_ino,
+    let name_identity = FileIdentity {
+        device: at_name.st_dev as u64,
+        inode: at_name.st_ino,
     };
-    if !is_instance_tombstone(&path, tombstone.expected_uid) || path_identity != tombstone.identity
+    if !is_instance_tombstone(&at_name, record.expected_uid) || name_identity != staged_identity {
+        return Err(SupervisorError::TombstoneChanged {
+            detail: "the pathname does not name the inert tombstone this retirement staged"
+                .to_owned(),
+        });
+    }
+    let staged_stat = rustix::fs::fstat(staged).map_err(errno)?;
+    if (FileIdentity {
+        device: staged_stat.st_dev as u64,
+        inode: staged_stat.st_ino,
+    }) != staged_identity
+        || staged_stat.st_nlink != 1
     {
         return Err(SupervisorError::TombstoneChanged {
-            detail: "pathname does not name the retired held descriptor".to_owned(),
+            detail: "the staged tombstone changed while it was being renamed into place".to_owned(),
         });
     }
     Ok(())
@@ -3208,21 +3342,23 @@ fn file_identity_at(
 /// record. The same observer over the same 2000 cycles saw 0200-with-content 0
 /// times.
 ///
-/// **The path is not thereby down to three faces, and an earlier draft of this
-/// comment claimed it was.** `retire_held_record` above, at the `fchmod` and
-/// `ftruncate` at `daemon.rs:1453-1455`, still walks a *published* record
-/// through 0200-with-content in place — and `validate_held_published_record`
-/// has just proven that descriptor is still linked at the destination, so the
-/// state is on the path, not off it. `inspect` takes no lifecycle lock while
-/// `start_with` does, so a concurrent reader can still sample it. Two syscalls
-/// wide rather than an `fsync`, and the record there has been proven dead
-/// twice over, so the verdict it produces is unflattering rather than false —
-/// but it is the last in-tree producer and it is not fixed.
+/// ~~The path is not thereby down to three faces.~~ **Corrected: it is now.**
+/// The remaining producer was `retire_held_record` above, which walked a
+/// *published* record through 0200-with-content in place — it `fchmod`-ed the
+/// live inode and only then truncated it, and `validate_held_published_record`
+/// had just proven that descriptor still linked at the destination, so the
+/// state was on the path rather than off it. `inspect` takes no lifecycle lock
+/// while `start_with` does, so a concurrent reader could sample it. Retirement
+/// now stages an inert file under a `.reclaim-` name, renames it over the
+/// destination, and empties the record only once the rename has taken it out of
+/// the namespace, so it mutates nothing that anyone can still reach by name.
 ///
-/// So the reachable producers are: `retire_held_record`, and a `gascand` older
-/// than the change above. **Not** a daemon that dies mid-publish — under the
-/// new publisher that leaves the destination absent and the half-written record
-/// under a staging name, which is a different failure with a different cure.
+/// So the only reachable producer left is a `gascand` older than the change
+/// above. **Not** a daemon that dies mid-publish — under the new publisher that
+/// leaves the destination absent and the half-written record under a staging
+/// name, which is a different failure with a different cure. **Not** the CLI's
+/// retirement, whose ordering is the mirror of the publisher's and is argued at
+/// `retire_held_record`.
 ///
 /// Size is therefore reported in every case, because it is the field that
 /// separates them and its absence made a CI failure unattributable.
@@ -3519,8 +3655,9 @@ mod tests {
         ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
         SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
         connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
-        read_attested_instance, read_instance_record_with_hook, restart_with, signal_attested_with,
-        signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
+        open_interrupted_tombstone, read_attested_instance, read_instance_record_with_hook,
+        restart_with, retire_held_record, signal_attested_with, signal_attested_with_deadline,
+        signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
     use super::{inspect_process_with, parse_lsof_executable};
@@ -5725,6 +5862,50 @@ mod tests {
         fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
         assert_eq!(fs::read(paths.instance())?, replacement);
         assert_eq!(spawner.0.load(AtomicOrdering::Acquire), 0);
+        Ok(())
+    }
+
+    /// Retirement has two jobs: leave a legal inert tombstone at the destination,
+    /// and destroy the dead record's bytes so a descriptor that outlives this
+    /// process cannot read the owner token back. A rename alone does the first and
+    /// silently drops the second, which is why the old inode is truncated after the
+    /// rename rather than instead of it.
+    #[tokio::test]
+    async fn retirement_replaces_the_record_and_empties_the_inode_it_retired() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        fs::write(paths.instance(), b"a-record-with-a-token")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
+
+        let held =
+            open_interrupted_tombstone(&paths)?.ok_or("expected an interrupted tombstone")?;
+        let retired_inode = rustix::fs::fstat(&held.file)?.st_ino;
+
+        retire_held_record(&held)?;
+
+        let at_name = fs::symlink_metadata(paths.instance())?;
+        assert_eq!(
+            at_name.permissions().mode() & 0o777,
+            0o200,
+            "the destination is inert"
+        );
+        assert_eq!(at_name.len(), 0, "the destination is empty");
+        assert_ne!(
+            std::os::unix::fs::MetadataExt::ino(&at_name),
+            retired_inode,
+            "the destination still names the retired inode; it was mutated in place",
+        );
+
+        let held_after = rustix::fs::fstat(&held.file)?;
+        assert_eq!(
+            held_after.st_nlink, 0,
+            "the retired inode is still in the namespace"
+        );
+        assert_eq!(
+            held_after.st_size, 0,
+            "the retired inode still holds its bytes"
+        );
         Ok(())
     }
 
