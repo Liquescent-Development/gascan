@@ -16,46 +16,73 @@ CI flakes.
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**PR #87 IS OPEN, GREEN, AND DELIBERATELY NOT MERGED. DO NOT MERGE IT AS A FIRST ACT.** Branch
-`fix/daemon-reader-retryable-verdict` carries open item 1's residual — the reader's half of the
-daemon instance record. It is **22 commits off `main` at merge-base `61f1b3c`**
-(`git rev-list --count main..fix/daemon-reader-retryable-verdict` → 22;
-`git merge-base main fix/daemon-reader-retryable-verdict` → `61f1b3c64b10decbd6548543d9e6bfccbcdac048`),
-and at head `d5ea334` `changes`, `contracts`, `rust` and `gate` all pass with `engine` skipping,
-`mergeable=MERGEABLE mergeStateStatus=CLEAN`. **Re-derive every one of those with `gh pr view 87`,
-`gh pr checks 87`, `git log -1` and `git status`** — the SHAs and branch states written in this
-file have gone stale repeatedly, sometimes within hours.
+**PR #87 IS OPEN AND THE READER HALF IS NOW COMPLETE ON IT. IT IS STILL NOT MERGED — that is
+the maintainer's call, not a leftover.** Branch `fix/daemon-reader-retryable-verdict` carries
+open item 1 entire, producer and reader. At the time of writing it is **25 commits off `main` at
+merge-base `61f1b3c`** (`git rev-list --count main..fix/daemon-reader-retryable-verdict` → 25;
+`git merge-base main fix/daemon-reader-retryable-verdict` →
+`61f1b3c64b10decbd6548543d9e6bfccbcdac048`), head `ae03597`. **Re-derive every one of those with
+`gh pr view 87`, `gh pr checks 87`, `git log -1` and `git status`** — the SHAs and branch states
+written in this file have gone stale repeatedly, sometimes within hours.
 
-**The maintainer left it open on purpose**: the next session finishes the reader half **on this
-branch**, rather than merging a partial fix and opening a second PR for the rest. That is a
-decision, not an oversight.
+**THE ASSIGNMENT THAT STOOD HERE IS DONE, AND THE HEADLINE IT LEFT BEHIND WAS WRONG IN ONE
+DIRECTION THAT MATTERS.** The residue this file enumerated named the "0200 and empty" fault and
+the `EACCES` as the motivating case's tears. It missed the largest one. MEASURED at `bf107a1`
+with a temporary probe not retained in the tree — one reader spinning on
+`read_instance_record_for_inspection` against a publish-and-retire loop, over five seconds:
 
-**THE ASSIGNMENT IS TO FINISH THE READER HALF, AND IT IS A DESIGN TASK RATHER THAN A SWEEP.**
-Five sites carry `raced()` — the `raced(` constructor sites in `crates/gascan/src/daemon.rs`
-outside `mod tests`, two in `open_published_record` and three in `validate_instance_tombstone`.
-Five race-shaped failures are unmarked, and they are already enumerated in open item 1's
-`KNOWINGLY LEFT` block; read that rather than re-deriving it. Three things constrain the work:
+| unmarked fault | samples |
+|---|---|
+| `link count is not one (mode 0600, links 0)` | **2426** |
+| `mode is 0200 and the file is empty` | 1138 |
+| bare `EACCES` from the `O_RDONLY` `openat` | 11 |
 
-- **The design's own motivating case is still largely uncovered.** A `gascan status` run against a
-  legitimately stopping daemon — the published→inert transition — tears onto faults that fire
-  *before* the marks in `open_published_record` are reached. Open item 1 says exactly which.
-- **The five cannot simply be marked.** `validate_file_stat` is reached from five production call
-  sites, two of which are inside the generic helpers `validate_open_file` and `file_identity_at`,
-  and `validate_open_file` is what the lifecycle lock is validated through as well as the instance
-  record. Its "0200 and empty" fault is a genuine fault for what else it guards, so reclassifying
-  it takes per-call-site context — a design change, not one edit. **Count those call sites against
-  the tree yourself** before acting on this sentence.
-- **The partial state is safe to sit on.** An independent review of PR #87 judged shipping it sound
-  because it is **monotone**: no verdict this branch produces is less trustworthy than `main`'s in
-  the same state. That is why the rest can be designed properly instead of rushed.
+The `nlink == 0` tear — the reader still holding the inode a rename unlinked — was the *most
+common* way a `gascan status` tore across an ordinary stop, and it was in neither the residue
+list nor the design. It was found by writing the end-to-end test the file admitted did not
+exist, which is the lesson worth carrying: the enumeration in a handoff doc is a hypothesis.
 
-Open item 1 already records the rest of what you need and it is not repeated here: the five
-unmarked sites and the reader residue in its `KNOWINGLY LEFT` block, PR #87's five review minors
-recorded unfixed, and — in the `ALSO LEFT` passage about `inspect_with`'s delegation — the
-module-privacy remedy that turns bypassing the retry into a compile error at zero cost to
-`inspect_with`'s callers.
+**WHAT LANDED, all in `ae03597`.** The file being guarded is now a parameter, `GuardedFile`
+(`LifecycleLock` | `InstanceRecord`), threaded through `validate_file_stat`, `validate_open_file`
+and `file_identity_at`; the faults became values, and `StatFault::is_transitional_for` holds the
+**entire** widening in one function — `Unlinked` and `InertTombstone`, for `InstanceRecord` only.
+Production `raced()` constructor sites went from 5 to **16**; count them yourself with
+`awk 'NR<4450 && /raced\(/' crates/gascan/src/daemon.rs` rather than trusting either number.
 
-**AFTER the reader half there is a QUEUE, not a menu, and the maintainer chooses from it:**
+**What deliberately did NOT move, and this is the line to defend:** `0200` *with content* stays
+terminal, per the three-face rule — nothing will finish that record, so a retry would report a
+permanently stuck one as a passing squall. Foreign owner, non-regular file, extra hard links and
+wrong modes stay terminal everywhere, the instance record included. The lifecycle lock treats
+every fault as a fault, including the two that are transitions for the record, and
+`the_lifecycle_lock_treats_every_fault_as_terminal` is what holds that.
+
+**The retry composition is sealed.** `observe::sealed` holds `inspect_with_hook`,
+`retry_while_raced` and `observe_once_with_hook`; only the first leaves the module. The mutation
+the previous review measured as silently green — rewriting `inspect_with`'s delegation to call
+the observation directly — is now a compile error, VERIFIED: `cargo build -p gascan` fails with
+E0425, ``cannot find function `observe_once_with_hook` in module `observe` ``. Note the review's
+premise was off by one: `inspect_with_hook` has **two** legitimate callers, not one —
+`inspect_with` and `ensure_started_locked_with_hook`'s readiness loop.
+
+**All five review minors are now fixed**, not four; the fifth was the module seal above. Each of
+the other three is held by a test that fails when the fix is reverted — measured individually.
+
+**VERIFIED at `ae03597`:** `cargo fmt --all --check` exit 0, `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo test --workspace` **1532 passed, 0 failed, 49
+ignored**. The three race loops were additionally run twice at 30,000 cycles each with no
+unmarked failure; they are committed at 4096 cycles, where a mutation of either dominant
+classification is caught 3 of 3. **CI status at this head must be re-derived — do not trust a
+"green" written here.**
+
+**Three defensive branches are recorded as NOT covered by a driving test, deliberately and not
+by oversight:** `stage_inert_reclaim_file`'s new staging-name check — unreachable by construction,
+since the staging name is freshly created under `O_EXCL` and unguessable — joining the two the
+previous review already listed the same way (`empty_unlinked_inode`'s `st_nlink != 0` refusal and
+`validate_retired_tombstone`'s rename check). Open item 1 has been rewritten end to end; read it
+there before assuming anything named in this file is still open.
+
+**THE READER HALF IS DONE, SO THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
+and the maintainer chooses from it:
 
 1. **The three unfixed CI flake mechanisms this file names** — the empty pid-file read, the
    `reconcile` phase matrix that is red on `main` itself, and the `lifecycle` ephemeral-port
@@ -365,11 +392,13 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
 
 ### WHAT IS OPEN
 
-1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). THE READER'S HALF
-   — THIS ITEM'S RESIDUAL — IS FIXED ON `fix/daemon-reader-retryable-verdict`, OPEN AS PR #87 AND
-   DELIBERATELY UNMERGED SO THAT THE REST IS FINISHED ON THAT SAME BRANCH.
-   THAT HALF IS PARTIAL AND THE RESIDUE INCLUDES THE COMMON CASE; THE LAST BLOCKS OF THIS ITEM
-   SAY WHAT IS LEFT.**
+1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). THE READER'S
+   HALF — THIS ITEM'S RESIDUAL — IS NOW COMPLETE ON `fix/daemon-reader-retryable-verdict`, OPEN
+   AS PR #87 AND STILL UNMERGED BY THE MAINTAINER'S CHOICE.**
+
+   ~~THAT HALF IS PARTIAL AND THE RESIDUE INCLUDES THE COMMON CASE.~~ **Superseded `ae03597`:
+   the common case is covered, and the residue list this item carried was itself incomplete —
+   see the last blocks of this item for what was found and what genuinely remains.**
 
    **What it was.** `write_instance_record` (`crates/gascand/src/socket.rs`) created the record
    at its final path inert — 0200, empty — wrote the content, `sync_all`-ed, then chmod-ed to
@@ -396,8 +425,8 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    `gascan status` could sample it. The design change that paragraph said was needed is the
    change that was made.
 
-   **BOTH HALVES ARE FIXED ON BRANCH `fix/daemon-reader-retryable-verdict`, WHICH IS OPEN AS
-   PR #87 AND DELIBERATELY NOT MERGED — see the cold-start block at the top of this file.**
+   **BOTH HALVES ARE FIXED AND COMPLETE ON BRANCH `fix/daemon-reader-retryable-verdict`, WHICH
+   IS OPEN AS PR #87 AND NOT MERGED — see the cold-start block at the top of this file.**
    Base `61f1b3c`. Re-derive the commit range with
    `git log --oneline main..fix/daemon-reader-retryable-verdict` rather than trusting a SHA
    written here; the SHAs in this file have gone stale on their own repeatedly.
@@ -471,104 +500,77 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    into a failure the retry looks at again. **No end-to-end verdict flip was tested, and none is
    claimed.**
 
-   **KNOWINGLY LEFT: THE RETRY COVERS FIVE RACE-SHAPED FAILURES AND THE REST ARE STILL TERMINAL,
-   INCLUDING THE COMMON CASE.** The five carrying `raced()` in `crates/gascan/src/daemon.rs` are
-   the three in `validate_instance_tombstone` and the two in `open_published_record` — find them
-   by the `raced(` constructor, not by line number.
+   **THE READER HALF IS COMPLETE AS OF `ae03597`. THE BLOCKS THAT STOOD HERE — `KNOWINGLY
+   LEFT`, `ALSO LEFT` AND `FIVE MINORS` — ARE ALL DISCHARGED, AND WHAT REPLACES THEM IS SHORT.**
 
-   **A `gascan status` that samples the path while a `gascand` renames its inert tombstone over a
-   published record — the published→inert transition, which is what a legitimate stop does — is
-   not among them in the common case.** A reader whose first `statat` lands after the rename sees
-   a plain tombstone and answers `Stopped`; the failures come from tearing across it, and those
-   tears reach `validate_file_stat`'s "mode is 0200 and the file is empty" fault (through
-   `file_identity_at`, either before the read or on the recheck after it) or the `EACCES` an
-   `O_RDONLY` `openat` returns against a 0200 file. Neither is marked, and
-   `open_interrupted_tombstone` answers `Ok(None)` on the way past because an inert tombstone is
-   not an interrupted one — so the verdict is built from the record read's unmarked failure and
-   is terminal. `open_published_record`'s own two marks are not reached on this path at all: they
-   sit *after* its `openat` and its `validate_open_file`, so they fire only when the replacement
-   is itself a legal published record — a publisher committing over a live record, rarer than a
-   stop. What this branch demonstrably changed is the tombstone-to-tombstone substitution and the
-   `clear_inert_destination` `ENOENT`.
+   **The design problem was real and the answer was a parameter, not a sweep.**
+   `validate_file_stat` could not be reclassified in place because it guards two different files
+   through two generic helpers. It now takes `GuardedFile` (`LifecycleLock` | `InstanceRecord`),
+   threaded through `validate_open_file` and `file_identity_at`, and its faults are values rather
+   than message strings so that the terminal/retryable decision is made once, in
+   `StatFault::is_transitional_for`, against the file being guarded. A call site added later
+   cannot inherit a classification by accident — it will not compile until it states one.
 
-   **The rest of the residue, none of it marked:** the record read's "daemon instance record
-   changed while opening it" and "…changed while reading it"; `open_interrupted_tombstone`'s
-   "interrupted daemon instance descriptor changed while opening it" and "…path changed while
-   opening it"; and `validate_open_file`'s "protected runtime file changed while opening it".
-   Each fires when the name was substituted between two of the reader's own looks in a way the
-   stop transition above does not produce — that transition trips a `validate_file_stat` fault or
-   the `EACCES` first. Same characterisation as the recheck `statat` below — narrow, real and
-   fail-closed — and left for the same reason.
+   **The widening is exactly two faults on exactly one file:** `Unlinked` (`st_nlink == 0`) and
+   `InertTombstone` (0200 and empty), for `InstanceRecord` only. Everything else stays terminal
+   everywhere, and the one to defend is **`UnpublishedRecord` — 0200 with content**. Per the
+   three-face rule nothing will finish that record, so retrying it would report a permanently
+   stuck record as a passing squall. `ExtraLinks` is excluded on purpose: a second name for the
+   file is someone else's doing, not the daemon's.
 
-   **Marking the rest is not a text change and must not be rushed.** `validate_file_stat` has
-   **five production call sites** in `crates/gascan/src/daemon.rs` — two in
-   `validate_held_published_record`, one in `open_published_record`, and one each inside the two
-   generic helpers `validate_open_file` and `file_identity_at` — and `validate_open_file` is what
-   the **lifecycle lock** is validated through (`LifecycleLock`'s two acquisition paths call it on
-   `LIFECYCLE_LOCK_NAME`), not only the instance record. Count them yourself with
-   `awk '/validate_file_stat\(/ && !/fn validate_file_stat/' crates/gascan/src/daemon.rs`, which
-   returns those five plus two under `mod tests`; do not trust the number written here. So "0200
-   and empty" is a genuine fault for something else it guards, and reclassifying it needs
-   per-call-site context — a design change, not one edit. Widening a fail-closed classification at
-   the end of a branch is how that default gets weakened by accident.
+   **The residue list this file used to carry was incomplete, and the omission was the biggest
+   item on it.** MEASURED at `bf107a1` with a temporary probe not in the tree, five seconds of a
+   publish-and-retire loop: 2426 `link count is not one (mode 0600, links 0)`, 1138 `mode is 0200
+   and the file is empty`, 11 bare `EACCES`. The `nlink == 0` tear was never enumerated here. The
+   three identity-comparison messages the old list *did* name produced **zero** samples in that
+   window: `validate_file_stat` reaches a verdict first on every path the stop transition takes.
+   They are classified now regardless, driven by their own tests.
 
-   **THE PARTIAL STATE IS SAFE TO SIT ON WHILE THE REST IS DESIGNED.** An independent review of
-   PR #87 judged shipping it sound because it is **monotone**: no verdict this branch produces is
-   less trustworthy than `main`'s in the same state. That is the argument for designing the
-   remainder properly rather than bolting it onto the end of this branch.
+   **`EACCES` is classified by evidence, not by declaration**, because no validator sees it —
+   the record read's `O_RDONLY` `openat` is refused by the kernel first.
+   `classify_unreadable_instance_record` looks at the name again and marks it raced only if it
+   now holds an inert tombstone or has gone. A record chmod-ed to 0200 and *left* there still
+   reaches the caller as `Unsafe`, which is the tampering shape and the reason the split is
+   narrow.
 
-   **Inside `validate_instance_tombstone`, whose comparisons are marked, the recheck `statat`'s
-   own `ENOENT` is not.** Find it as the
-   `rustix::fs::statat(...).map_err(errno)?` after the `fstat` in that function — do not trust a
-   line number. Only the `openat` above it got the split. The exposed window is characterised
-   rather than guessed: `openat`→`fstat` is already covered, because an unlink there leaves
-   `st_nlink == 0`, `is_instance_tombstone` fails, and the existing raced mark fires. What is left
-   is `fstat`→recheck-`statat`, and within that only the sub-window between a successor's
-   `unlinkat` and its `renameat_with`. Narrow, real, and fail-closed today: the cost is an
-   unflattering `Unsafe` where a retry would have settled it, not a wrong action. It was left out
-   deliberately rather than missed, to keep the branch's scope where its evidence was.
+   **One classification changes what a caller sees, not just how it is labelled.**
+   `file_identity_at`'s `ENOENT` was `NotFound`, and `read_instance_record_for_inspection` maps
+   `NotFound` to `Ok(None)` — so that window used to read out as a confident "stopped" for a
+   daemon mid-transition. `raced()` builds a `PermissionDenied`, which that arm no longer
+   swallows. This is also why a test above that mapping cannot see this class of bug: MEASURED,
+   with the reader on the inspection wrapper, removing the `openat` `ENOENT` split entirely was
+   caught **0 times in 3 runs**.
 
-   **ALSO LEFT: the wiring test pins the retry, not `inspect_with`'s own delegation.**
-   `a_raced_observation_is_looked_at_again_through_inspect_with` drives a real race through
-   `inspect_with_hook`, which is where `retry_while_raced` is composed with the observation.
-   MEASURED 2026-08-19 on this branch with `cargo test -p gascan --lib`: collapsing that
-   function's body to a single `observe_once_with_hook` gives **307 passed, 1 failed** — that one
-   test and nothing else — and `OBSERVATIONS = 1` gives the same. But rewriting `inspect_with`'s
-   one-line delegation to call `observe_once_with_hook` directly gives **308 passed, 0 failed**:
-   that mutation is not caught. It is the residual every `_with_hook` pair in this file carries.
-   The one failing test in each caught run is the new one, so the collapse is silent without it.
-   **A test is not the only way to close it, and it is not the cheapest.** An independent review
-   of PR #87 on 2026-08-19 pointed out that moving `retry_while_raced` and
-   `observe_once_with_hook` into a private submodule that exports only `inspect_with_hook` turns
-   bypassing the retry into a **compile error** rather than a silently-green mutation, at zero
-   cost to `inspect_with`'s callers. Rust's module privacy is the tool for "this function has
-   exactly one legitimate caller", and `inspect_with_hook` is that shape. Prefer it to threading
-   a hook parameter outward.
+   **The retry composition is sealed, which is the fifth minor.** `observe::sealed` holds
+   `inspect_with_hook`, `retry_while_raced` and `observe_once_with_hook`; only the first leaves
+   the module. Rewriting `inspect_with`'s delegation to call the observation directly is now a
+   compile error — VERIFIED, `cargo build -p gascan` fails with E0425. The review's premise was
+   off by one: that function has **two** legitimate callers, `inspect_with` and
+   `ensure_started_locked_with_hook`'s readiness loop.
 
-   **FIVE MINORS FROM THAT SAME REVIEW, RECORDED UNFIXED.** The two Importants it raised are
-   fixed on this branch; these four are not, and the fifth is the module-privacy remedy above.
-   Locations are function names on purpose — line numbers in this file have gone stale within
-   hours.
+   **The other four minors are fixed, each held by a test that fails when the fix is reverted:**
+   `stage_inert_reclaim_file` now performs the staging-name check its doc comment already claimed
+   it shared with `gascand`'s mirror; `inspect_with_hook` takes the retry delay as a parameter so
+   `SupervisorTimeouts::poll` reaches it (MEASURED before the test existed: putting `DEFAULT_POLL`
+   back passed all 320 tests — nothing held it, and
+   `the_retry_waits_the_caller_s_poll_rather_than_the_constant` does now); and the give-up
+   verdict's marker composes the terminal endpoint fault with the race instead of dropping the
+   actionable half.
 
-   - **`stage_inert_reclaim_file` (`crates/gascan/src/daemon.rs`) omits the check its stated
-     mirror performs.** Its doc comment claims it shares the recipe "create exclusive, `fchmod`,
-     then verify rather than assume" with `stage_inert_instance_file`
-     (`crates/gascand/src/socket.rs`). `gascand` verifies both the descriptor and that the
-     staging *name* still resolves to the inode it opened; `gascan` verifies only the descriptor.
-     Either close the gap or stop claiming the mirror.
-   - **`DEFAULT_POLL` unifies the value and severs the knob.** `inspect_with_hook` passes the
-     constant to `retry_while_raced`, so the retry delay is the one poll in the supervisor that a
-     caller's `SupervisorTimeouts::poll` cannot reach.
-   - **A terminal endpoint fault's detail is discarded by the give-up path.** On
-     `observe_once_with_hook`'s `EndpointProbe::Unsafe` arm the detail composes a genuinely
-     terminal endpoint fault with the record race; `retry_while_raced`'s give-up verdict carries
-     only the race detail, so the actionable half is lost. The verdict stays `Unsafe`, so nothing
-     unsafe follows from it.
-   - **Two defensive branches are unverified, not covered**: `empty_unlinked_inode`'s
-     `st_nlink != 0` refusal, and `validate_retired_tombstone`'s "the staged tombstone changed
-     while it was being renamed into place" check. Both are unreachable by construction on every
-     path the review could trace, which is why it did not ask for tests. If either is ever
-     reported in the field it will be the first time it has run.
+   **WHAT IS STILL NOT COVERED BY A DRIVING TEST, and it is three defensive branches, all
+   recorded rather than missed:** `stage_inert_reclaim_file`'s new staging-name comparison, plus
+   the two the previous review already listed — `empty_unlinked_inode`'s `st_nlink != 0` refusal
+   and `validate_retired_tombstone`'s "staged tombstone changed while being renamed into place"
+   check. All three are unreachable by construction on every path traceable in the tree. If any
+   is ever reported in the field it will be the first time it has run.
+
+   **How the coverage is actually held, because the shape matters for anyone extending it.**
+   Three loop tests drive real producers and assert that *every* failure the reader produces is
+   marked; four hook- or fixture-driven tests pin the windows the loops structurally cannot reach.
+   That split is not stylistic — MEASURED at 4096 cycles, the stop-transition loop catches a
+   reverted `Unlinked` or `InertTombstone` classification 3/3, but catches the record read's two
+   identity comparisons only 1/3 and 0/3, because a published→published transition is not
+   something that loop produces. Raising the cycle count does not fix that and was tried.
 
 2. **(2c) THE DAEMON'S PRODUCTION LOG IS DECIDED AND UNBUILT. DO NOT RE-OPEN THE DECISION.**
    The maintainer ruled on 2026-08-18: **daemon-level events only, redacted.** Start, stop and
