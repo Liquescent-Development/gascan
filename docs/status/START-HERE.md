@@ -202,8 +202,15 @@ startup diagnostic. Each old name was true of one of the four. The other five ke
 
 **One of the two adjacent constants stayed put; the other has since moved, and the reason it
 moved is worth keeping.** `STARTUP_DIAGNOSTIC_NAME` is still in `daemon.rs`, still carrying the
-comment saying why it is not shared, and it became `pub(crate)` so the four hard-coded literals
-in `crates/gascan/src/client.rs` name it through the constant.
+comment saying why it is not shared, and it became `pub(crate)` so the **two** hard-coded
+occurrences of it in `crates/gascan/src/client.rs` name it through the constant. **Corrected:
+this sentence said "the four hard-coded literals" — four is the count for that file, not for
+this constant.** Two of the four were the startup diagnostic's name and go through
+`STARTUP_DIAGNOSTIC_NAME`; the other two were the instance record's name and go through
+`gascan_core::daemon_protocol::INSTANCE_NAME`. VERIFIED at the pre-item-9 base:
+`git grep -c daemon-startup-error 3cf98b5 -- crates/gascan/src/client.rs` returns 2, and the
+same command for `daemon-instance` returns 2. Both pairs sit in the two `DaemonPaths`-building
+blocks in that file; grep for the two constant names rather than trusting a line number.
 
 `INSTANCE_STAGING_PURPOSE` was left in `socket.rs` by item 9 on the argument that `gascand` was
 the only stager. That argument expired: on branch `fix/daemon-reader-retryable-verdict` the
@@ -361,9 +368,12 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    shared protocol in `gascan_core::daemon_protocol` and the sweeper covers both.
 
    **The reader half.** Race-shaped failures carry a marker (`raced` / `is_raced`) and the whole
-   observation sequence — `observe_once` — is retried up to three times rather than any single
-   validator, because retrying one observation against stale others manufactures fresh
-   disagreements. **Classification is terminal by default**: only a failure explicitly
+   observation sequence — `observe_once` — is what retries, rather than any single validator,
+   because retrying one observation against stale others manufactures fresh disagreements.
+   **Three observations total, which is two retries** — `const OBSERVATIONS: u32 = 3` driving
+   `for observation in 0..observations` in `retry_while_raced`, with `DEFAULT_POLL` between.
+   Count the observations, not the retries; the verdict's own message says "still changing after
+   3 observations". **Classification is terminal by default**: only a failure explicitly
    constructed as raced retries, so a validator added later that nobody classifies stays
    `Unsafe`. `(0200, content)` stays terminal on purpose — see the three-face rule in
    `gascan_core::daemon_protocol`: the only producer left in production code is a `gascand` from

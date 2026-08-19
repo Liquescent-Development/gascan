@@ -205,18 +205,19 @@ The observations are interdependent — the record, the published record opened 
 record, and the endpoint probe. Retrying one against stale others manufactures fresh
 disagreements. The retry restarts the sequence from the top.
 
-Three observations total, with `SupervisorTimeouts::poll` between, matching the
-`for probe_index in 0..2` shape `recover_interrupted_tombstone` already uses at
-`crates/gascan/src/daemon.rs:1366`. Under `start_with` the lifecycle lock makes a race
-impossible, so the retry is unreachable there and costs nothing.
+Three observations total — which is **two retries**, and the observation count is the number to
+quote — with `SupervisorTimeouts::poll` between, matching the `for probe_index in 0..2` shape
+`recover_interrupted_tombstone` in `crates/gascan/src/daemon.rs` already uses. Under
+`start_with` the lifecycle lock makes a race impossible, so the retry is unreachable there and
+costs nothing.
 
 ### 4.3 What is transient
 
 Transient: the two `validate_instance_tombstone` "changed while…" failures; the
 `open_published_record` "changed while binding its descriptor" failure and its identity and
 size recheck mismatches; and the `ENOENT` that `gascand`'s `clear_inert_destination`
-(`crates/gascand/src/socket.rs:530`) made newly reachable, which surfaces at the `openat` in
-`validate_instance_tombstone` (`crates/gascan/src/daemon.rs:2855`).
+(`crates/gascand/src/socket.rs`) made newly reachable, which surfaces at the `openat` in
+`validate_instance_tombstone` (`crates/gascan/src/daemon.rs`).
 
 That last one closes the third piece of open item 1's residual.
 
