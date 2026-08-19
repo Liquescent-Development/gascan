@@ -6,26 +6,64 @@ addressed to you, the agent. Follow it as instructions — there is nothing to p
 Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day after the daemon
 instance record's publish race was fixed and merged (PR #80, #81). Updated again 2026-08-19,
 from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
-retryable verdict — was implemented there; that branch was **not merged** when this was written.
-Everything above the `Where the work is` heading is current; everything below it is history.
+retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
+merged**. Everything above the `Where the work is` heading is current; everything below it is
+history, **with two exceptions added 2026-08-19 that are current**: the sections headed
+`THE FOURTH MECHANISM` and `THE FIFTH MECHANISM`, which describe live CI flakes.
 
 ---
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**Item 9 is merged. Open item 1's residual — the reader's half of the daemon instance record —
-is implemented on branch `fix/daemon-reader-retryable-verdict`, which is IN FLIGHT: not merged,
-not pushed at the time this was written.** Verify with `git log -1`, `git status` and
-`git branch -a`; do not trust a SHA or a branch state written in this file, both of which have
-gone stale here repeatedly.
+**PR #87 IS OPEN, GREEN, AND DELIBERATELY NOT MERGED. DO NOT MERGE IT AS A FIRST ACT.** Branch
+`fix/daemon-reader-retryable-verdict` carries open item 1's residual — the reader's half of the
+daemon instance record. It is **22 commits off `main` at merge-base `61f1b3c`**
+(`git rev-list --count main..fix/daemon-reader-retryable-verdict` → 22;
+`git merge-base main fix/daemon-reader-retryable-verdict` → `61f1b3c64b10decbd6548543d9e6bfccbcdac048`),
+and at head `d5ea334` `changes`, `contracts`, `rust` and `gate` all pass with `engine` skipping,
+`mergeable=MERGEABLE mergeStateStatus=CLEAN`. **Re-derive every one of those with `gh pr view 87`,
+`gh pr checks 87`, `git log -1` and `git status`** — the SHAs and branch states written in this
+file have gone stale repeatedly, sometimes within hours.
 
-**If that branch is still unmerged, finishing it is the assignment**: review, merge, and then
-carry the one knowingly-left follow-up recorded at the end of open item 1 — the unmarked,
-terminal `ENOENT` on the recheck `statat` in `validate_instance_tombstone`. **If it is merged,
-the next assignment is the maintainer's to choose**; item 2c is the obvious candidate and is
-**decided but unbuilt** — the product question was ruled on 2026-08-18 and must not be
-re-litigated, but nothing has been implemented and the engineering questions under open item 2
-are still open.
+**The maintainer left it open on purpose**: the next session finishes the reader half **on this
+branch**, rather than merging a partial fix and opening a second PR for the rest. That is a
+decision, not an oversight.
+
+**THE ASSIGNMENT IS TO FINISH THE READER HALF, AND IT IS A DESIGN TASK RATHER THAN A SWEEP.**
+Five sites carry `raced()` — the `raced(` constructor sites in `crates/gascan/src/daemon.rs`
+outside `mod tests`, two in `open_published_record` and three in `validate_instance_tombstone`.
+Five race-shaped failures are unmarked, and they are already enumerated in open item 1's
+`KNOWINGLY LEFT` block; read that rather than re-deriving it. Three things constrain the work:
+
+- **The design's own motivating case is still largely uncovered.** A `gascan status` run against a
+  legitimately stopping daemon — the published→inert transition — tears onto faults that fire
+  *before* the marks in `open_published_record` are reached. Open item 1 says exactly which.
+- **The five cannot simply be marked.** `validate_file_stat` is reached from five production call
+  sites, two of which are inside the generic helpers `validate_open_file` and `file_identity_at`,
+  and `validate_open_file` is what the lifecycle lock is validated through as well as the instance
+  record. Its "0200 and empty" fault is a genuine fault for what else it guards, so reclassifying
+  it takes per-call-site context — a design change, not one edit. **Count those call sites against
+  the tree yourself** before acting on this sentence.
+- **The partial state is safe to sit on.** An independent review of PR #87 judged shipping it sound
+  because it is **monotone**: no verdict this branch produces is less trustworthy than `main`'s in
+  the same state. That is why the rest can be designed properly instead of rushed.
+
+Open item 1 already records the rest of what you need and it is not repeated here: the five
+unmarked sites and the reader residue in its `KNOWINGLY LEFT` block, PR #87's five review minors
+recorded unfixed, and — in the `ALSO LEFT` passage about `inspect_with`'s delegation — the
+module-privacy remedy that turns bypassing the retry into a compile error at zero cost to
+`inspect_with`'s callers.
+
+**AFTER the reader half there is a QUEUE, not a menu, and the maintainer chooses from it:**
+
+1. **The two unfixed CI flake mechanisms this file names** — the empty pid-file read, and the
+   `reconcile` phase matrix that is red on `main` itself. Both are written up under the headings
+   `THE FOURTH MECHANISM` and `THE FIFTH MECHANISM`, which sit *below* the `Where the work is`
+   heading despite being current.
+2. **Item 2c, the daemon's production log.** Decided 2026-08-18 — daemon-level events only,
+   redacted, verbose logging as an explicit opt-in — and unbuilt. What remains is engineering, not
+   product; the decision must not be re-litigated. See open item 2.
+
 **You do not need the milestone-4 design, plan, or ledger** — that table is context for the
 milestone that closed, not a reading list. The one document you must read before touching
 anything about *offline* is `docs/evidence/2026-08-18-arca-engine-offline.md`.
@@ -165,10 +203,13 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 **THAT ASSIGNMENT — OPEN ITEM 1'S RESIDUAL, "THE READER HAS NO RETRYABLE VERDICT" — WAS
 EXECUTED.** The maintainer chose it on 2026-08-18 over fixing the CI flakes and over the four
 small gaps, because it was a wrong answer a user could actually see. It is implemented on branch
-`fix/daemon-reader-retryable-verdict` off base `3cf98b5`, in eight reviewed tasks (more commits
-than that — count them with `git log --oneline main..fix/daemon-reader-retryable-verdict`, do not
-trust a number written here), **and that branch is not merged.** The full record of what changed, what it measured, and what it knowingly
-left is under `WHAT IS OPEN` item 1 — read that, not this summary.
+`fix/daemon-reader-retryable-verdict` off base `61f1b3c` (`git log -1 --format=%p 3e2cc9e`, the
+branch's first commit, returns `61f1b3c`), in eight reviewed tasks (more commits than that — count
+them with `git log --oneline main..fix/daemon-reader-retryable-verdict`, do not trust a number
+written here), **and that branch is open as PR #87 and deliberately not merged.** Why, and what
+finishing it means, is in the cold-start block at the top of this file. The full record of what
+changed, what it measured, and what it knowingly left is under `WHAT IS OPEN` item 1 — read that,
+not this summary.
 
 **The shape it had, kept because it is what the fix is answering:** `start_with` takes the
 lifecycle lock and `inspect` does not, so a `gascan status` run concurrently with a legitimate
@@ -314,15 +355,17 @@ baseline and 15 contracts at status 0. Verify every SHA here with `git log -1` a
 `git ls-remote`; do not trust one written in this file. Open item 1 below records what that
 merge left behind and what the branch after it did about it.
 
-**Item 9 is merged. Item 1's residual is implemented on an unmerged branch — see
-THE ONE THING TO DO NEXT above and open item 1 below. Everything else in this list is carried
+**Item 9 is merged. Item 1's residual is implemented on `fix/daemon-reader-retryable-verdict`,
+open as PR #87 and deliberately unmerged — see the cold-start block at the top of this file,
+THE ONE THING TO DO NEXT above, and open item 1 below. Everything else in this list is carried
 state, not an assignment.** Item 2c was decided on 2026-08-18 and **remains decided but
 unbuilt**: an unstarted implementation with a specified shape, not an open question.
 
 ### WHAT IS OPEN
 
 1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). THE READER'S HALF
-   — THIS ITEM'S RESIDUAL — IS FIXED ON AN UNMERGED BRANCH, `fix/daemon-reader-retryable-verdict`.
+   — THIS ITEM'S RESIDUAL — IS FIXED ON `fix/daemon-reader-retryable-verdict`, OPEN AS PR #87 AND
+   DELIBERATELY UNMERGED SO THAT THE REST IS FINISHED ON THAT SAME BRANCH.
    THAT HALF IS PARTIAL AND THE RESIDUE INCLUDES THE COMMON CASE; THE LAST BLOCKS OF THIS ITEM
    SAY WHAT IS LEFT.**
 
@@ -351,8 +394,9 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    `gascan status` could sample it. The design change that paragraph said was needed is the
    change that was made.
 
-   **BOTH HALVES ARE FIXED ON BRANCH `fix/daemon-reader-retryable-verdict`, WHICH IS NOT MERGED.**
-   Base `3cf98b5`. Re-derive the commit range with
+   **BOTH HALVES ARE FIXED ON BRANCH `fix/daemon-reader-retryable-verdict`, WHICH IS OPEN AS
+   PR #87 AND DELIBERATELY NOT MERGED — see the cold-start block at the top of this file.**
+   Base `61f1b3c`. Re-derive the commit range with
    `git log --oneline main..fix/daemon-reader-retryable-verdict` rather than trusting a SHA
    written here; the SHAs in this file have gone stale on their own repeatedly.
 
@@ -454,10 +498,22 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    the `EACCES` first. Same characterisation as the recheck `statat` below — narrow, real and
    fail-closed — and left for the same reason.
 
-   **Marking the rest is not a text change and must not be rushed.** `validate_file_stat`'s
-   "0200 and empty" is a genuine fault for the socket and the lifecycle lock, so it could only be
-   reclassified per call site, and widening a fail-closed classification at the end of a branch
-   is how that default gets weakened by accident.
+   **Marking the rest is not a text change and must not be rushed.** `validate_file_stat` has
+   **five production call sites** in `crates/gascan/src/daemon.rs` — two in
+   `validate_held_published_record`, one in `open_published_record`, and one each inside the two
+   generic helpers `validate_open_file` and `file_identity_at` — and `validate_open_file` is what
+   the **lifecycle lock** is validated through (`LifecycleLock`'s two acquisition paths call it on
+   `LIFECYCLE_LOCK_NAME`), not only the instance record. Count them yourself with
+   `awk '/validate_file_stat\(/ && !/fn validate_file_stat/' crates/gascan/src/daemon.rs`, which
+   returns those five plus two under `mod tests`; do not trust the number written here. So "0200
+   and empty" is a genuine fault for something else it guards, and reclassifying it needs
+   per-call-site context — a design change, not one edit. Widening a fail-closed classification at
+   the end of a branch is how that default gets weakened by accident.
+
+   **THE PARTIAL STATE IS SAFE TO SIT ON WHILE THE REST IS DESIGNED.** An independent review of
+   PR #87 judged shipping it sound because it is **monotone**: no verdict this branch produces is
+   less trustworthy than `main`'s in the same state. That is the argument for designing the
+   remainder properly rather than bolting it onto the end of this branch.
 
    **Inside `validate_instance_tombstone`, whose comparisons are marked, the recheck `statat`'s
    own `ENOENT` is not.** Find it as the
