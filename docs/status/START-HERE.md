@@ -211,9 +211,27 @@ message can now only go stale by someone changing the protocol and not the prose
 **Every step of CI's `rust` job was run locally and alone on that branch** — `cargo fmt --all
 --check` 0, `cargo clippy --workspace --all-targets -- -D warnings` 0, `cargo test --workspace`
 **1504 passed, 0 failed, 49 ignored**, `./scripts/ci-check-ignored-tests.sh` 49 matching the
-baseline. 1504 is the 1499 of the last merged run plus the five tests added here. It is also
-the only job the diff triggers: `scripts/ci-classify-paths.sh` returns `rust=true
-contracts=false engine=false`.
+baseline. 1504 is the 1499 of the last merged run plus the five tests added here.
+
+**CI ON PR #83: `changes` green, `contracts` green, `engine` skipped, `rust` RED, `gate` RED
+because `rust` was.** The red is
+`apple_common::tests::pty_resize_driver_drains_chatty_child_without_backpressure_timeout`,
+`chatty resize child was throttled for 2.104840875s` against the hard 2s wall-clock bound at
+`crates/gascan-e2e/tests/apple_common/mod.rs:4357`. **This is the PTY wall-clock flake this
+file already names as one of the three standing root causes**, and it is the same test that
+failed PR #69's `rust` job twice, missing the same bound by 100ms and by 2.3ms.
+
+**Exonerated by diff PLUS isolation, never by probability**, using the proof this file
+prescribes: `git diff 3cf98b5..HEAD -- crates/gascan-e2e/` is **empty**, so the branch cannot
+have caused it; and the test passes alone 5 of 5, in 0.40-0.55s against a 2s bound. The test
+spawns `sh` and `dd` and touches no daemon-protocol path at all.
+
+**A CLAIM IN THIS FILE AND IN `a493cb8`'s COMMIT MESSAGE WAS WRONG AND IS CORRECTED HERE.**
+Both said `scripts/ci-classify-paths.sh` returns `contracts=false` and that `rust` was the only
+job the diff triggers. That was measured on the **code-only** diff, before the docs commit
+existed. On the branch as pushed it returns `rust=true contracts=true engine=false`, which is
+what CI did. `contracts` passed, so nothing was hidden by it — but the classification must be
+re-run after the last commit, not before it.
 
 **Everything below this paragraph in this section is the record of items finished before this
 one. It is not an assignment.**
