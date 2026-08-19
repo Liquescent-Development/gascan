@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use gascan_core::daemon_protocol::{
-    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_TOMBSTONE_MODE, LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE,
-    SOCKET_NAME,
+    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_STAGING_PURPOSE, INSTANCE_TOMBSTONE_MODE,
+    LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE, SOCKET_NAME,
 };
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -26,10 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const _: () = assert!(DIRECTORY_MODE as u32 == gascan_proto::SOCKET_DIRECTORY_MODE);
 const _: () = assert!(PRIVATE_FILE_MODE as u32 == gascan_proto::SOCKET_MODE);
 
-/// The staging prefix the sweeper matches. This one is `gascand`'s alone: no
-/// reader ever sees a staged file by name, so it is not part of the shared
-/// protocol and must not join it.
-const INSTANCE_STAGING_PURPOSE: &str = "instance";
 static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]

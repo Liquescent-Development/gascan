@@ -21,8 +21,8 @@
 //! what happens when the new writer meets the old reader.
 
 use gascan_core::daemon_protocol::{
-    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_TOMBSTONE_MODE, LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE,
-    SOCKET_NAME,
+    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_STAGING_PURPOSE, INSTANCE_TOMBSTONE_MODE,
+    LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE, RECLAIM_STAGING_PURPOSE, SOCKET_NAME,
 };
 
 #[test]
@@ -53,4 +53,15 @@ fn the_protocol_file_names_are_stable() {
     assert_eq!(SOCKET_NAME, "gascand.sock");
     assert_eq!(INSTANCE_NAME, "daemon-instance.json");
     assert_eq!(LIFECYCLE_LOCK_NAME, "daemon-lifecycle.lock");
+}
+
+/// Two processes now stage files in the daemon's runtime directory, so the
+/// prefixes are protocol rather than private detail: `gascand`'s sweeper
+/// matches both, and a prefix that changed on one side alone would either
+/// orphan files forever or sweep a live one.
+#[test]
+fn the_staging_prefixes_are_stable_and_distinct() {
+    assert_eq!(INSTANCE_STAGING_PURPOSE, "instance");
+    assert_eq!(RECLAIM_STAGING_PURPOSE, "reclaim");
+    assert_ne!(INSTANCE_STAGING_PURPOSE, RECLAIM_STAGING_PURPOSE);
 }

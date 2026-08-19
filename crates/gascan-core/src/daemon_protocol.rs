@@ -11,10 +11,12 @@
 //!
 //! Nothing here is a default that a caller may override, and one edit here is
 //! now the only way to change any of it: renaming or removing any of the six
-//! stops both `gascan` and `gascand` from compiling. MEASURED on 2026-08-18 by
-//! renaming each of the six in turn and running `cargo check -p gascan
-//! --all-targets` and `cargo check -p gascand --all-targets`: twelve of twelve
-//! failed to compile.
+//! file-protocol values stops both `gascan` and `gascand` from compiling.
+//! MEASURED on 2026-08-18 by renaming each of the six in turn and running
+//! `cargo check -p gascan --all-targets` and `cargo check -p gascand
+//! --all-targets`: twelve of twelve failed to compile. The two staging
+//! prefixes at the bottom of this file joined afterwards and that measurement
+//! does not cover them.
 //!
 //! Changing a value, by contrast, is *not* a compile error -- both crates
 //! simply agree on the new one, which is the point, and is also why neither
@@ -39,8 +41,7 @@
 //! written but never published, which `gascan`'s `validate_file_stat` turns
 //! into a terminal `DaemonState::Unsafe`. `gascand` keeps it off the path by
 //! building every next state under a staging name (see
-//! `INSTANCE_STAGING_PURPOSE` in `crates/gascand/src/socket.rs`, which is
-//! that crate's alone) and renaming it into place.
+//! [`INSTANCE_STAGING_PURPOSE`]) and renaming it into place.
 //!
 //! **One in-tree producer still violates the rule and is not fixed.**
 //! `retire_held_record` in `crates/gascan/src/daemon.rs` `fchmod`s a
@@ -98,3 +99,20 @@ pub const INSTANCE_NAME: &str = "daemon-instance.json";
 /// The lifecycle lock serialising start and stop, relative to the runtime
 /// directory.
 pub const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
+
+/// The staging-name prefix `gascand` uses while building the next instance
+/// record, as `.{purpose}-{token}`.
+///
+/// A staged file is never read by name -- it exists only to be renamed into
+/// place -- but the prefix is shared because `gascand`'s sweeper matches it to
+/// clean up files a crash abandoned, and it must match what the writer wrote.
+pub const INSTANCE_STAGING_PURPOSE: &str = "instance";
+
+/// The staging-name prefix the `gascan` CLI uses while building the inert
+/// tombstone that retires a record it has proven dead, as `.{purpose}-{token}`.
+///
+/// Distinct from [`INSTANCE_STAGING_PURPOSE`] so that a stray file says which
+/// process left it, and so the sweeper can reason about the two separately:
+/// `gascand`'s staging holds a complete record with an owner token in it, while
+/// this one is inert and empty from birth and never holds anything.
+pub const RECLAIM_STAGING_PURPOSE: &str = "reclaim";
