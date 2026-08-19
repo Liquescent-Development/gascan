@@ -11,17 +11,18 @@ instance record's publish race was fixed and merged (PR #80, #81). Everything ab
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**Both repositories are on `main` with clean worktrees. There is no branch to check out and
-nothing is in flight.** Verify with `git log -1` and `git status`; do not trust a SHA in this
-file, which has gone stale on its own SHAs repeatedly.
+**Item 9 is done and is in flight as a pull request on the branch
+`refactor/shared-daemon-file-protocol`. Arca is on `main` with a clean worktree.** Verify with
+`git log -1`, `git status` and `gh pr list`; do not trust a SHA in this file, which has gone
+stale on its own SHAs repeatedly.
 
-**Your assignment is open item 9 and its brief is under `THE ONE THING TO DO NEXT` below.** It
-is a cross-crate constant move. **You do not need the milestone-4 design, plan, or ledger for
-it** — that table is context for the milestone that just closed, not a reading list for this
-task. The one document you must read before touching anything about *offline* is
-`docs/evidence/2026-08-18-arca-engine-offline.md`, and item 9 does not touch offline.
+**No next item has been chosen. Do not pick one for yourself** — ask. Item 1's residual is the
+standing candidate and item 2c must not be decided alone; both are under `WHAT IS OPEN` below.
+**You do not need the milestone-4 design, plan, or ledger** — that table is context for the
+milestone that closed, not a reading list. The one document you must read before touching
+anything about *offline* is `docs/evidence/2026-08-18-arca-engine-offline.md`.
 
-**Four things that will bite you on this task specifically, all measured:**
+**Four things that will bite you in this tree, all measured:**
 
 1. **Never run `cargo test --workspace` beside another cargo or contract job.** A solo run is
    internally parallel too. Exonerate a failure by diff PLUS isolation, never by probability.
@@ -153,60 +154,92 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### THE ONE THING TO DO NEXT
 
-**YOUR ASSIGNMENT IS OPEN ITEM 9: move the six duplicated file-protocol values into
-`gascan-core` and make both crates import them.** The maintainer chose it on 2026-08-18, in
-preference to open item 1's residual, on the grounds that it is the cheapest of the open items
-and it removes a whole class of silent drift — a class this milestone has already paid for
-twice. **Start a fresh branch off `main`.**
+**NOTHING IS ASSIGNED. ASK BEFORE STARTING ONE.** Item 9 was the assignment and it is done —
+its record is immediately below. Item 1's residual is the standing candidate for what follows
+and item 2c needs a decision rather than an implementation; both are under `WHAT IS OPEN`.
 
-**What to move, VERIFIED by reading both files on 2026-08-18 rather than trusting this table:**
+### ITEM 9 IS DONE. IT IS IN FLIGHT AS A PULL REQUEST, NOT MERGED.
 
-| value | `crates/gascand/src/socket.rs` | `crates/gascan/src/daemon.rs` |
-|---|---|---|
-| `0o700` | `DIRECTORY_MODE` :14 | `DIRECTORY_MODE` :16 |
-| `0o600` | **`SOCKET_MODE`** :15 | **`FILE_MODE`** :17 |
-| `0o200` | `INSTANCE_TOMBSTONE_MODE` :16 | `INSTANCE_TOMBSTONE_MODE` :18 |
-| `"gascand.sock"` | `SOCKET_NAME` :18 | `SOCKET_NAME` :19 |
-| `"daemon-instance.json"` | `INSTANCE_NAME` :19 | `INSTANCE_NAME` :20 |
-| `"daemon-lifecycle.lock"` | `LIFECYCLE_LOCK_NAME` :20 | `LIFECYCLE_LOCK_NAME` :21 |
+**Branch `refactor/shared-daemon-file-protocol`, one commit off `main` at `3cf98b5`. Re-derive
+its head with `git log -1` rather than trusting a SHA written here.** The six duplicated
+file-protocol values now live in `gascan_core::daemon_protocol`, and both
+`crates/gascand/src/socket.rs` and `crates/gascan/src/daemon.rs` import them.
 
-**`0o600` does not share a name across the two crates, and that is the point** — `SOCKET_MODE`
-in one and `FILE_MODE` in the other. Nothing greps it up, which is how the duplicate survived
-every review this file records.
+**`0o600` is `PRIVATE_FILE_MODE` there — neither crate's old name, and the rename is
+deliberate.** It was `SOCKET_MODE` in `gascand` and `FILE_MODE` in `gascan`, and the value
+covers four things: the socket, the published instance record, the lifecycle lock and the
+startup diagnostic. Each old name was true of one of the four. The other five kept their names.
 
-**TWO CONSTANTS IN THOSE SAME BLOCKS ARE NOT SHARED AND MUST NOT BE MOVED.**
-`INSTANCE_STAGING_PURPOSE` (`socket.rs:17`) is `gascand`'s alone — it names the staging prefix
-the sweeper matches — and `STARTUP_DIAGNOSTIC_NAME` (`daemon.rs:22`) is `gascan`'s alone. They
-sit adjacent to the six and a careless block move takes them along.
+**The two adjacent constants did not move.** `INSTANCE_STAGING_PURPOSE` stayed in `socket.rs`
+and `STARTUP_DIAGNOSTIC_NAME` stayed in `daemon.rs`, each now carrying a comment saying why it
+is not shared. `STARTUP_DIAGNOSTIC_NAME` became `pub(crate)` so the four hard-coded literals in
+`crates/gascan/src/client.rs` name it through the constant.
 
-**FOUR MORE SITES HARD-CODE THE PROTOCOL NAMES AS STRING LITERALS** and so would not follow a
-constant that changed: `crates/gascan/src/client.rs:727`, `:730`, `:784`, `:787`
-(`"daemon-instance.json"` and `"daemon-startup-error.json"`). They are inside `#[cfg(test)]`
-code, which is exactly why they are worth fixing — **a test that hard-codes the name cannot
-fail when the constant drifts.** Sweep them in the same change.
+**THE RESULT WORTH CARRYING FORWARD IS THAT THE ACCEPTANCE BAR IN THE OLD BRIEF WAS NOT
+REACHABLE AS WRITTEN, AND MEASURING IT SHOWED WHY.** The brief said a value change in
+`gascan-core` must break both crates at compile time. Renaming or removing a constant does
+exactly that — MEASURED, each of the six renamed in turn, `cargo check -p gascan --all-targets`
+and `cargo check -p gascand --all-targets`, twelve of twelve failed to compile. But changing a
+**value** is not a compile error at all, and consolidation is what makes it invisible: both
+halves now agree on the new value. MEASURED with `INSTANCE_TOMBSTONE_MODE` at `0o220` instead
+of `0o200`, `cargo test -p gascand --lib` reported **111 passed, 0 failed** — every assertion
+in it compares against the constant, not against `0o200` — while `cargo test -p gascan --lib`
+reported **285 passed, 11 failed**, and only because its fixtures spell the mode out.
 
-**The shared home, VERIFIED 2026-08-18:** `gascan-core` is already a path dependency of both
-(`crates/gascan/Cargo.toml:15`, `crates/gascand/Cargo.toml:10`), so this costs no new crate, and
-`gascan-core` depends on neither of them, so there is no cycle. It already carries `rustix` and
-already hosts `startup_diagnostic.rs`, which is precedent for daemon-protocol material living
-there.
+**So the value dimension is guarded by `crates/gascan-core/tests/daemon_protocol.rs`**, which
+restates each of the six literals once as the second place an edit has to reach. That is the
+same guard `crates/gascan-proto/tests/api_compatibility.rs` already puts on the two of these
+values that are also published API. Each of the six was mutated and the pin test failed on all
+six.
 
-**Carry the three-face rule with the constants, as module documentation.** It is the strongest
-unwritten coupling in the tree and it is currently asserted by a test in `gascand` and consumed
-by a classifier in `gascan` with nothing connecting them: **the instance path shows exactly
-three faces — absent, `(0200, 0)`, and `(0600, len>0)` — and only a stat with `st_nlink == 1`
-is a state of the path at all.** Change `gascan`'s `INSTANCE_TOMBSTONE_MODE` today and
-`gascand`'s tests still pass while the classification silently breaks. That is the failure that
-cost five workspace runs and one CI run.
+**A THIRD COPY OF TWO OF THEM WAS FOUND, AND IT IS NOT IN THE OLD BRIEF'S TABLE.**
+`crates/gascan-proto/src/lib.rs:10-12` declares `SOCKET_DIRECTORY_MODE` `0o700` and
+`SOCKET_MODE` `0o600` as published API. It cannot move — deleting it changes the published
+surface — so `crates/gascand/src/socket.rs` binds it with two `const` assertions instead.
+MEASURED: `PRIVATE_FILE_MODE` at `0o640` fails the `gascand` build with `error[E0080]`.
 
-**How to know you have actually done it:** after the move, changing a value in `gascan-core`
-must break both crates at compile time. Prove it by mutation — flip one and see both fail —
-rather than by inspection. **Do not weaken any test to make the move compile**, and do not
-rename the surviving constants to match one crate's spelling without saying which you chose and
-why.
+**Deliberately not swept: the on-disk names hard-coded throughout `crates/gascan-e2e`.** Those
+tests check the protocol from outside the crates that implement it, so a literal there is the
+external contract rather than a copy of an internal one. Reverse that judgement if you disagree
+with it, but do it knowingly.
 
-**Everything below this paragraph in this section is the record of the item that was just
-finished. It is not an assignment.**
+**One thing was left alone and is worth a later look:** `validate_file_stat` in
+`crates/gascan/src/daemon.rs` still reports `"mode is not 0600"` as a literal string beside
+`PRIVATE_FILE_MODE`. The pin test makes the value immovable without a deliberate edit, so the
+message can now only go stale by someone changing the protocol and not the prose.
+
+**Every step of CI's `rust` job was run locally and alone on that branch** — `cargo fmt --all
+--check` 0, `cargo clippy --workspace --all-targets -- -D warnings` 0, `cargo test --workspace`
+**1504 passed, 0 failed, 49 ignored**, `./scripts/ci-check-ignored-tests.sh` 49 matching the
+baseline. 1504 is the 1499 of the last merged run plus the five tests added here.
+
+**CI ON PR #83: `changes` green, `contracts` green, `engine` skipped, `rust` RED, `gate` RED
+because `rust` was.** The red is
+`apple_common::tests::pty_resize_driver_drains_chatty_child_without_backpressure_timeout`,
+`chatty resize child was throttled for 2.104840875s` against the hard 2s wall-clock bound at
+`crates/gascan-e2e/tests/apple_common/mod.rs:4357`. **This is the PTY wall-clock flake this
+file already names as one of the three standing root causes**, and it is the same test that
+failed PR #69's `rust` job twice, missing the same bound by 100ms and by 2.3ms.
+
+**Exonerated by diff PLUS isolation, never by probability**, using the proof this file
+prescribes: `git diff 3cf98b5..HEAD -- crates/gascan-e2e/` is **empty**, so the branch cannot
+have caused it; and the test passes alone 5 of 5, in 0.40-0.55s against a 2s bound. The test
+spawns `sh` and `dd` and touches no daemon-protocol path at all.
+
+**THE RE-RUN AT `1a8d33c` WAS GREEN ON EVERYTHING** — `changes`, `contracts`, `rust` and
+`gate` all passed, `engine` skipped, run `32206399534`, with `mergeable=MERGEABLE
+mergeStateStatus=CLEAN`. The same tree, the same tests: that is what the flake looks like from
+the other side, and it is why a single red `rust` is not evidence about a branch.
+
+**A CLAIM IN THIS FILE AND IN `a493cb8`'s COMMIT MESSAGE WAS WRONG AND IS CORRECTED HERE.**
+Both said `scripts/ci-classify-paths.sh` returns `contracts=false` and that `rust` was the only
+job the diff triggers. That was measured on the **code-only** diff, before the docs commit
+existed. On the branch as pushed it returns `rust=true contracts=true engine=false`, which is
+what CI did. `contracts` passed, so nothing was hidden by it — but the classification must be
+re-run after the last commit, not before it.
+
+**Everything below this paragraph in this section is the record of items finished before this
+one. It is not an assignment.**
 
 **DONE AND MERGED — PR #80, merge commit `025b922`, a true merge (`git rev-list --parents -n1`
 returns three SHAs). The branch `fix/daemon-instance-publish-race` was deleted after
@@ -228,10 +261,10 @@ baseline and 15 contracts at status 0. Verify every SHA here with `git log -1` a
 `git ls-remote`; do not trust one written in this file. Open item 1 below now records what is
 left rather than what to do, and **what is left is real** — see its residual section.
 
-**The maintainer chose item 9 on 2026-08-18 — see THE ONE THING TO DO NEXT above. Everything
-else in this list is carried state, not an assignment.** Item 1's residual is the natural
-continuation after it. Item 2c needs a decision rather than an implementation and **must not be
-decided alone**.
+**Item 9 is done and awaiting review; nothing else here has been assigned. Everything in this
+list is carried state, not an assignment.** Item 1's residual is the standing candidate for
+what follows. Item 2c needs a decision rather than an implementation and **must not be decided
+alone**.
 
 ### WHAT IS OPEN
 
@@ -311,25 +344,18 @@ decided alone**.
 7. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
    swapping the exit-status and timeout checks leaves the supervisor suite green.
 8. **A pre-existing stash is on the stack and is not ours.** Leave it.
-9. **THIS IS THE CURRENT ASSIGNMENT — the brief is under THE ONE THING TO DO NEXT above, and it
-   carries the verified table, the two constants that must NOT move, and the four hard-coded
-   literals to sweep. SIX FILE-PROTOCOL VALUES ARE DECLARED INDEPENDENTLY IN BOTH CRATES, AND
-   ONE OF THEM DOES NOT EVEN SHARE A NAME.** Found by review on 2026-08-18. `DIRECTORY_MODE` 0o700
-   (`gascand/src/socket.rs:14`, `gascan/src/daemon.rs:16`); 0o600, which is `SOCKET_MODE` in one
-   (`socket.rs:15`) and `FILE_MODE` in the other (`daemon.rs:17`) — **which is how a duplicate
-   survives review: nothing greps it up**; `INSTANCE_TOMBSTONE_MODE` 0o200 (`:16`, `:18`);
-   `SOCKET_NAME` (`:17`, `:19`); `INSTANCE_NAME` (`:18`, `:20`); `LIFECYCLE_LOCK_NAME` (`:19`,
-   `:21`).
+9. **DONE, AND IN FLIGHT AS A PULL REQUEST — NOT MERGED.** The six file-protocol values that
+   were declared independently in both crates now live in `gascan_core::daemon_protocol`, on the
+   branch `refactor/shared-daemon-file-protocol`. The full record, including the two results that
+   the brief for it did not anticipate, is under `ITEM 9 IS DONE` above.
 
-   The publish-race fix **makes this mildly worse**, and that is worth stating plainly: it adds a
-   stronger unwritten rule — the instance path shows exactly three faces — asserted by a test in
-   `gascand` and consumed by a classifier in `gascan`, with nothing mechanically connecting them.
-   Change `gascan`'s `INSTANCE_TOMBSTONE_MODE` and `gascand`'s tests still pass while the
-   classification silently breaks, which is the exact failure that cost five workspace runs.
-
-   `crates/gascan-core` is already a path dependency of **both** (`gascan/Cargo.toml:15`,
-   `gascand/Cargo.toml:10`), so the shared home exists and costs no new crate. **Its own commit**
-   — folding it into a fix buries the fix under a cross-crate move.
+   **What it leaves behind, and it is small but real:** the value of a shared constant is now
+   guarded only by `crates/gascan-core/tests/daemon_protocol.rs`, because neither consuming
+   crate's suite notices a value change once both halves agree on it — MEASURED, `cargo test -p
+   gascand --lib` reported 111 passed, 0 failed with `INSTANCE_TOMBSTONE_MODE` at `0o220`. The
+   on-disk names hard-coded throughout `crates/gascan-e2e` were deliberately not swept, on the
+   grounds that a literal in a test outside the implementing crates is the external contract
+   rather than a copy. Both judgements are reversible and neither has been reviewed yet.
 
 ### WHAT WAS RUN, AND WHAT CI DOES WITH IT
 

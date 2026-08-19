@@ -724,10 +724,10 @@ mod tests {
         let launch = DaemonLaunch {
             executable: script,
             current_dir: runtime.clone(),
-            instance_path: runtime.join("daemon-instance.json"),
+            instance_path: runtime.join(gascan_core::daemon_protocol::INSTANCE_NAME),
             owner_token: "test-owner".to_owned(),
             stderr_path: Some(diagnostic.clone()),
-            startup_diagnostic_path: runtime.join("daemon-startup-error.json"),
+            startup_diagnostic_path: runtime.join(crate::daemon::STARTUP_DIAGNOSTIC_NAME),
         };
 
         let mut monitor = DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
@@ -781,10 +781,10 @@ mod tests {
         let launch = DaemonLaunch {
             executable: script,
             current_dir: runtime.clone(),
-            instance_path: runtime.join("daemon-instance.json"),
+            instance_path: runtime.join(gascan_core::daemon_protocol::INSTANCE_NAME),
             owner_token: "test-owner".to_owned(),
             stderr_path: Some(diagnostic.clone()),
-            startup_diagnostic_path: runtime.join("daemon-startup-error.json"),
+            startup_diagnostic_path: runtime.join(crate::daemon::STARTUP_DIAGNOSTIC_NAME),
         };
 
         let mut monitor = DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;

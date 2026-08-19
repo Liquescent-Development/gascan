@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod backend;
+pub mod daemon_protocol;
 pub mod doctor;
 pub mod engine_artifacts;
 pub mod fake_runtime;
