@@ -1745,6 +1745,24 @@ fn reclaim_staging_name() -> Result<String, SupervisorError> {
 /// unlinked with its content intact, reachable by any descriptor that outlives
 /// this process, and that content is what holds the owner token.
 fn retire_held_record(record: &InterruptedTombstone) -> Result<(), SupervisorError> {
+    retire_held_record_with_hook(record, |_| Ok(()))
+}
+
+/// Retirement with the window between staging and the commit exposed. The
+/// ordering argument that governs this body is on `retire_held_record` above.
+///
+/// The hook receives the staging name because the only thing a test wants to do
+/// in that window is reach the staging file, and the name carries a random
+/// token no caller can predict. Production passes a no-op, the same shape
+/// `read_instance_record_with_hook` and `observe_once_with_hook` already use in
+/// this file.
+fn retire_held_record_with_hook<F>(
+    record: &InterruptedTombstone,
+    before_commit: F,
+) -> Result<(), SupervisorError>
+where
+    F: FnOnce(&str) -> io::Result<()>,
+{
     let (staged, staging, staged_identity) =
         stage_inert_reclaim_file(&record.directory, record.expected_uid)?;
     let mut guard = ReclaimStagingGuard::new(&record.directory, &staging, staged_identity);
@@ -1779,13 +1797,35 @@ fn retire_held_record(record: &InterruptedTombstone) -> Result<(), SupervisorErr
             detail: "the pathname stopped naming the record this retirement validated".to_owned(),
         });
     }
+    before_commit(staging.as_str()).map_err(SupervisorError::Io)?;
     rustix::fs::renameat(
         &record.directory,
         staging.as_str(),
         &record.directory,
         record.name.as_os_str(),
     )
-    .map_err(|error| SupervisorError::Io(errno(error)))?;
+    .map_err(|error| {
+        // `ENOENT` here cannot be the destination going missing -- this rename
+        // replaces whatever is at that name, and finding nothing there is not an
+        // error. What it does reach is the staging file, which another process
+        // can unlink out from under this call: `sweep_abandoned_staging` in
+        // `crates/gascand/src/socket.rs` is `write_instance_record`'s first
+        // action, matches the `.reclaim-` prefix with no age or liveness filter,
+        // and the lifecycle lock does not fence every `gascand` -- that
+        // function's own doc comment names which ones it misses. Without this
+        // split the whole interaction reaches the user as `gascan start` failing
+        // with a bare "No such file or directory (os error 2)". Every other
+        // errno stays `Io`, which is the direction that fails closed.
+        if error == rustix::io::Errno::NOENT {
+            SupervisorError::TombstoneChanged {
+                detail: "the reclaim staging file was removed before it could be committed; \
+                         a concurrent gascand publication sweeps this prefix"
+                    .to_owned(),
+            }
+        } else {
+            SupervisorError::Io(errno(error))
+        }
+    })?;
     // Committed: the staging name is gone, so there is nothing left to clean up
     // and every exit below must leave the destination alone.
     guard.disarm();
@@ -4023,9 +4063,9 @@ mod tests {
         connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
         inspect_with_hook, is_raced, observe_once_with_hook, open_interrupted_tombstone,
         open_published_record, race_marker, raced, read_attested_instance,
-        read_instance_record_with_hook, restart_with, retire_held_record, retry_while_raced,
-        signal_attested_with, signal_attested_with_deadline, signal_identity, start_with,
-        stop_with, wait_for_exit_until,
+        read_instance_record_with_hook, restart_with, retire_held_record,
+        retire_held_record_with_hook, retry_while_raced, signal_attested_with,
+        signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
     use super::{inspect_process_with, parse_lsof_executable};
@@ -6333,6 +6373,59 @@ mod tests {
         assert!(
             residue.is_empty(),
             "the refusal left reclaim staging behind: {residue:?}",
+        );
+        Ok(())
+    }
+
+    /// A `gascand` that the lifecycle lock does not fence can delete the staging
+    /// file this retirement is holding open: `sweep_abandoned_staging` in
+    /// `crates/gascand/src/socket.rs` is `write_instance_record`'s first action
+    /// and matches the `.reclaim-` prefix with no age or liveness filter. The
+    /// rename then fails `ENOENT`, and whatever this returns is what the user
+    /// reads off a failed `gascan start`. It has to name the cause: a bare
+    /// `SupervisorError::Io` surfaces as "No such file or directory (os error
+    /// 2)" and attributes the failure to nothing.
+    #[tokio::test]
+    async fn a_swept_reclaim_staging_file_is_named_rather_than_reported_as_a_bare_io_failure()
+    -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        fs::write(paths.instance(), b"a-record-with-a-token")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
+
+        let held =
+            open_interrupted_tombstone(&paths)?.ok_or("expected an interrupted tombstone")?;
+        let directory = paths.directory().to_owned();
+        let result = retire_held_record_with_hook(&held, |staging| {
+            // What the sweeper does to this name, at the instant it can do it.
+            fs::remove_file(directory.join(staging))
+        });
+
+        let detail = match &result {
+            Err(SupervisorError::TombstoneChanged { detail }) => detail.clone(),
+            other => {
+                return Err(format!(
+                    "a swept staging file must not surface as an anonymous failure: {other:?}"
+                )
+                .into());
+            }
+        };
+        assert!(
+            detail.contains("reclaim staging file"),
+            "the failure must name the file that was removed: {detail}"
+        );
+
+        let at_name = fs::symlink_metadata(paths.instance())?;
+        assert_eq!(
+            at_name.permissions().mode() & 0o777,
+            0o200,
+            "the refusal changed the destination's mode"
+        );
+        assert_eq!(
+            at_name.len(),
+            "a-record-with-a-token".len() as u64,
+            "the refusal changed the destination's bytes"
         );
         Ok(())
     }

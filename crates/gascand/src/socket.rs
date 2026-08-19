@@ -530,10 +530,17 @@ where
 /// daemon sweeps outside the lock entirely. Either sweep can reach a
 /// `.reclaim-` file a CLI is staging under the lock at that moment.
 ///
-/// The cost of that is a failed rename of an empty file. The reclaim staging
-/// file is empty from birth and carries no token, so nothing leaks -- unlike
-/// this crate's own staging, which holds a complete record, and which is why
-/// the sweeper exists at all.
+/// Nothing leaks when that happens: the reclaim staging file is empty from
+/// birth and carries no token, unlike this crate's own staging, which holds a
+/// complete record and is why the sweeper exists at all. The cost is not
+/// nothing, though, and it does not stay in this crate. The CLI's rename fails
+/// `ENOENT` and takes the lifecycle command with it, so a `gascan start` dies
+/// because a `gascand` swept a file that command was holding open.
+/// `retire_held_record` in `crates/gascan/src/daemon.rs` maps that one errno to
+/// `SupervisorError::TombstoneChanged` and names this sweep in the detail, so
+/// the failure is attributable. It is not prevented: an age or liveness floor
+/// on what counts as abandoned would close the window, and this sweeper has
+/// neither.
 ///
 /// Failure to sweep is not failure to publish -- there is nothing a caller
 /// could do about a stale file it does not own -- so this returns nothing.
