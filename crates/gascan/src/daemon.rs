@@ -8489,10 +8489,18 @@ mod tests {
 
     /// `clear_inert_destination` in `crates/gascand/src/socket.rs` unlinks the
     /// tombstone, so this `openat` can return `ENOENT` where it could not before
-    /// the publish-race fix. `read_instance_record_for_inspection` maps `NotFound`
-    /// to `Ok(None)` and is unaffected; `read_attested_instance` propagates it,
-    /// and it has no non-test callers yet. Classifying it now removes a trap from
-    /// whoever wires it rather than leaving one.
+    /// the publish-race fix. Classifying it changes what a production caller sees
+    /// rather than merely labelling the error: `raced()` carries
+    /// `PermissionDenied`, so the `NotFound => Ok(None)` arm in
+    /// `read_instance_record_for_inspection` stops matching and stops swallowing
+    /// it. Driven through that function's `before_tombstone_validation` hook, the
+    /// mid-publish window returns `Ok(None)` unclassified and
+    /// `Err(PermissionDenied, raced)` classified -- so a daemon that is partway
+    /// through publishing stops reading as absent, which is the reading that
+    /// yields `Stopped` and could send a caller off to start a second one, and
+    /// becomes a failure `observe_once` can see and look at again.
+    /// `read_attested_instance` propagates the same error and has no non-test
+    /// callers yet.
     #[test]
     fn a_tombstone_that_vanishes_between_looks_is_a_race_not_a_fault() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -8511,6 +8519,46 @@ mod tests {
         assert!(
             is_raced(&error),
             "a successor unlinking the tombstone is a race, not a fault: {error}"
+        );
+        Ok(())
+    }
+
+    /// The narrowness of the split is the whole of its safety, so something has to
+    /// hold it narrow. A symlink swapped over the tombstone name is the
+    /// substitution `O_NOFOLLOW` exists to refuse; marking it raced would hand the
+    /// substituter a retry instead of a verdict. This is the sibling of the test
+    /// above and fails the moment the `map_err` stops discriminating on the errno.
+    #[test]
+    fn a_symlink_swapped_over_the_tombstone_is_a_fault_not_a_race() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let tombstone_mode = u32::from(INSTANCE_TOMBSTONE_MODE);
+        write_inert_tombstone(paths.instance(), tombstone_mode)?;
+
+        let (parent, name) = super::instance_parent_and_name(paths.instance())?;
+        let directory = super::open_private_directory_with_mode(parent, paths.expected_uid, false)?;
+        let stat = rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+
+        // The symlink points at a file that is itself a valid inert tombstone, so
+        // `O_NOFOLLOW` is the only thing standing between the reader and the
+        // substitution -- a decoy that would validate if it were ever followed.
+        let decoy = paths.instance().with_extension("decoy");
+        write_inert_tombstone(&decoy, tombstone_mode)?;
+        fs::remove_file(paths.instance())?;
+        std::os::unix::fs::symlink(&decoy, paths.instance())?;
+
+        let error = super::validate_instance_tombstone(&directory, name, &stat, paths.expected_uid)
+            .err()
+            .ok_or("a symlink standing in for the tombstone must not validate")?;
+        assert!(
+            !is_raced(&error),
+            "a symlink swapped over the tombstone is a fault, not a race: {error}"
+        );
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::LOOP.raw_os_error()),
+            "the refusal must be `O_NOFOLLOW` declining the symlink: {error}"
         );
         Ok(())
     }
