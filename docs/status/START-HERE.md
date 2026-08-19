@@ -9,8 +9,8 @@ from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual 
 retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
 merged**. Everything above the `Where the work is` heading is current; everything below it is
 history, **with three exceptions added 2026-08-19 that are current**: the sections headed
-`THE FOURTH MECHANISM`, `THE FIFTH MECHANISM` and `THE SIXTH MECHANISM`, which describe live
-CI flakes.
+`THE FOURTH MECHANISM`, `THE FIFTH MECHANISM`, `THE SIXTH MECHANISM` and
+`THE SEVENTH MECHANISM`, which describe live CI flakes.
 
 ---
 
@@ -93,11 +93,12 @@ there before assuming anything named in this file is still open.
 **THE READER HALF IS DONE, SO THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
 and the maintainer chooses from it:
 
-1. **The three unfixed CI flake mechanisms this file names** — the empty pid-file read, the
-   `reconcile` phase matrix that is red on `main` itself, and the `lifecycle` ephemeral-port
-   collision. All three are written up under the headings `THE FOURTH MECHANISM`,
-   `THE FIFTH MECHANISM` and `THE SIXTH MECHANISM`, which sit *below* the `Where the work is`
-   heading despite being current.
+1. **The four unfixed CI flake mechanisms this file names** — the empty pid-file read, the
+   `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
+   collision, and a `lifecycle` container left `Running` after a rejected `up`. All four are
+   written up under the headings `THE FOURTH MECHANISM` through `THE SEVENTH MECHANISM`, which
+   sit *below* the `Where the work is` heading despite being current. **Note the last two are
+   different tests in the same target**, so "the `lifecycle` flake" is not one thing.
 2. **Item 2c, the daemon's production log.** Decided 2026-08-18 — daemon-level events only,
    redacted, verbose logging as an explicit opt-in — and unbuilt. What remains is engineering, not
    product; the decision must not be re-litigated. See open item 2.
@@ -3052,6 +3053,37 @@ nothing more. The immediately preceding run, `32276791896` on `d5ea334`, passed 
 diff and not one from isolation: **the code under test was byte-identical to code CI had just
 run green.** When that is available it beats every other form of exoneration, and it costs one
 `git diff --name-only`.
+
+**THE SEVENTH MECHANISM, FOUND 2026-08-19 AND NOT DIAGNOSED: a `ContainerState` still `Running`
+in `gascand`'s `lifecycle` suite.** The `rust` job of run `32314592435`, on PR #87 at `93c77fe`,
+failed with:
+
+```
+---- retained_ssh_host_key_failure_removes_prior_alias_before_stop stdout ----
+thread '...' panicked at crates/gascand/tests/lifecycle.rs:1228:5:
+assertion `left == right` failed
+  left: Running
+ right: Stopped
+test result: FAILED. 78 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.08s
+error: test failed, to rerun pass `-p gascand --test lifecycle`
+```
+
+The test asserts that a failed `up` — rejected for `ssh_host_key_mismatch` — has left the
+container `Stopped`, and it sampled `Running`. **It is not diagnosed.** Whether the failure path
+returns before the stop completes, or the `FakeRuntime` publishes its state non-atomically, is
+exactly the kind of guess the fifth mechanism's entry warns against writing down. Note it is a
+*different* test from the sixth mechanism's in the same target, so "the `lifecycle` flake" is
+already at least two distinct mechanisms and should not be spoken of as one.
+
+**Exonerated by diff AND isolation, and the diff half is unusually clean here.**
+`crates/gascand/Cargo.toml`'s `[dev-dependencies]` does not list `gascan`, so the crate that
+commit changed is **not linked into this test binary at all**; and the assertion is on
+`ContainerState` from a `FakeRuntime`, not on `DaemonState`, so it shares no code with the
+reader classification. `git diff --name-only 8613f22 93c77fe` returns only
+`crates/gascan/src/daemon.rs` and `docs/status/START-HERE.md`. Isolation: the test was run six
+consecutive times locally with `cargo test -p gascand --test lifecycle
+retained_ssh_host_key_failure_removes_prior_alias_before_stop`, 1 passed 0 failed each time, and
+the full `cargo test --workspace` at that commit reported 85 suites, 1534 passed, 0 failed.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
