@@ -8,8 +8,9 @@ instance record's publish race was fixed and merged (PR #80, #81). Updated again
 from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
 retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
 merged**. Everything above the `Where the work is` heading is current; everything below it is
-history, **with two exceptions added 2026-08-19 that are current**: the sections headed
-`THE FOURTH MECHANISM` and `THE FIFTH MECHANISM`, which describe live CI flakes.
+history, **with three exceptions added 2026-08-19 that are current**: the sections headed
+`THE FOURTH MECHANISM`, `THE FIFTH MECHANISM` and `THE SIXTH MECHANISM`, which describe live
+CI flakes.
 
 ---
 
@@ -56,9 +57,10 @@ module-privacy remedy that turns bypassing the retry into a compile error at zer
 
 **AFTER the reader half there is a QUEUE, not a menu, and the maintainer chooses from it:**
 
-1. **The two unfixed CI flake mechanisms this file names** — the empty pid-file read, and the
-   `reconcile` phase matrix that is red on `main` itself. Both are written up under the headings
-   `THE FOURTH MECHANISM` and `THE FIFTH MECHANISM`, which sit *below* the `Where the work is`
+1. **The three unfixed CI flake mechanisms this file names** — the empty pid-file read, the
+   `reconcile` phase matrix that is red on `main` itself, and the `lifecycle` ephemeral-port
+   collision. All three are written up under the headings `THE FOURTH MECHANISM`,
+   `THE FIFTH MECHANISM` and `THE SIXTH MECHANISM`, which sit *below* the `Where the work is`
    heading despite being current.
 2. **Item 2c, the daemon's production log.** Decided 2026-08-18 — daemon-level events only,
    redacted, verbose logging as an explicit opt-in — and unbuilt. What remains is engineering, not
@@ -2905,6 +2907,24 @@ backpressure_timeout` (twice, missing a hard 2s wall-clock bound by 100ms and by
 `concurrent_clients_converge_on_one_private_daemon` (D7, above), and
 `same_image_apply_recreates_explicit_ssh_as_automatic`.
 
+**A SHARPER STATEMENT OF THE SAME WANDER, MEASURED ON ONE BRANCH: three consecutive completed
+`rust` runs, two different failing tests, and a green run between them.** On
+`fix/daemon-reader-retryable-verdict`, read from `gh run list --workflow=ci.yml --branch
+fix/daemon-reader-retryable-verdict` and `gh run view <id> --json jobs`:
+
+| run | head | `rust` |
+|---|---|---|
+| `32266053978` | `a902fd5` | red — `provision_and_health_kill_point_phase_matrix_has_exact_recovery_status` |
+| `32276791896` | `d5ea334` | **green** |
+| `32281948905` | `b1ef129` | red — `automatic_ssh_port_reservation_is_loopback_unprivileged_and_exclusive` |
+
+(A fourth run, `32276374732` at `56b343c`, was cancelled before `rust` concluded and is not
+counted.) **The last of those failed on a commit that changed no code at all** —
+`git diff --name-only d5ea334 b1ef129` returns `docs/status/START-HERE.md` and nothing else — so
+the identical code passed and then failed in consecutive runs. Two mechanisms, one branch, one
+day. **With six mechanisms and a wander this wide, a single red `rust` job is not evidence about
+a branch.**
+
 **One failure mode reproduced verbatim across branches, five days apart**, which is the
 proof it is not a given branch's doing: `main`'s `31203816056` and PR #69's third attempt
 both died as `KeygenRejected(KeygenRejection { outcome: Code(255), message:
@@ -2914,13 +2934,17 @@ both ending `error: test failed, to rerun pass \`-p gascand --test apply_setup\`
 **How to decide whether a red `rust` is yours.** Do not argue from probability — check the
 diff. `git diff <merge-base>..HEAD -- crates/<the failing crate>/` empty means your branch
 cannot have caused it, and that is a proof rather than an estimate. It was empty for
-`crates/gascan-e2e/` throughout P5.1.
+`crates/gascan-e2e/` throughout P5.1. **Exonerate by diff PLUS isolation, never by probability —
+but check first whether the failing commit changed any code at all**, with
+`git diff --name-only <the last commit CI ran> <head>`. When it did not, the question is
+settled without scoping a diff to a crate and without running anything in isolation, and on this
+branch that has been the cheapest exoneration available and also the strongest.
 
 **The standing rule: a green local `cargo test --workspace` is the bar. CI reports but
 must not gate, and flake-chasing waits** until someone is asked to do it. There are at
-least five distinct root causes to fix when that day comes — the PTY wall-clock bound,
-D7's `0200` window, the keygen `/dev/fd` descriptor, the empty pid file below, and the
-reconcile phase matrix below that.
+least six distinct root causes to fix when that day comes — the PTY wall-clock bound,
+D7's `0200` window, the keygen `/dev/fd` descriptor, the empty pid file below, the
+reconcile phase matrix below that, and the `lifecycle` ephemeral-port collision after it.
 
 **THE FOURTH MECHANISM, FOUND 2026-08-19 AND NOT FIXED: the e2e harness reads the pid file
 while it is empty.** `doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` failed
@@ -2964,6 +2988,30 @@ out of 12** and the full `cargo test -p gascand --test reconcile` passed **3 run
 is expected means a kill during the health phase left an operation looking successful, which
 is a description of the assertion and not a diagnosis; nobody has traced it. Do not repeat a
 guess about it as a finding.
+
+**THE SIXTH MECHANISM, FOUND 2026-08-19 AND NOT DIAGNOSED: an ephemeral-port collision in
+`gascand`'s `lifecycle` suite.** The `rust` job of run `32281948905`, on PR #87, failed with:
+
+```
+---- automatic_ssh_port_reservation_is_loopback_unprivileged_and_exclusive stdout ----
+Error: Os { code: 48, kind: AddrInUse, message: "Address already in use" }
+test result: FAILED. 78 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.91s
+error: test failed, to rerun pass `-p gascand --test lifecycle`
+```
+
+The test is `crates/gascand/tests/lifecycle.rs:342`. An ephemeral-port collision on a shared
+runner is as far as this goes. **It is not diagnosed. Do not write a guess about which port,
+which peer, or which reservation window as if it were a finding** — that is the error the fifth
+mechanism's entry warns about, one heading up.
+
+**Its exoneration is the cheapest in this file and also the strongest, because the commit it
+failed on changes no code at all.** The run's head is `b1ef129`, and
+`git diff --name-only d5ea334 b1ef129` returns `docs/status/START-HERE.md` — one Markdown file,
+nothing more. The immediately preceding run, `32276791896` on `d5ea334`, passed `rust`
+(`gh run view 32276791896 --json jobs`). So this is not an inference from an empty crate-scoped
+diff and not one from isolation: **the code under test was byte-identical to code CI had just
+run green.** When that is available it beats every other form of exoneration, and it costs one
+`git diff --name-only`.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
