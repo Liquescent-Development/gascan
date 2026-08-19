@@ -3758,11 +3758,12 @@ mod tests {
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
         DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
         DaemonStartupMonitor, DaemonState, DaemonTransition, EndpointPathState, EndpointProbe,
-        EndpointSession, InstanceTimestamp, MAX_STARTUP_DIAGNOSTIC_BYTES, OsProcessInspector,
-        ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
-        SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
-        connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
-        open_interrupted_tombstone, read_attested_instance, read_instance_record_with_hook,
+        EndpointSession, INSTANCE_TOMBSTONE_MODE, InstanceTimestamp, MAX_STARTUP_DIAGNOSTIC_BYTES,
+        OsProcessInspector, PRIVATE_FILE_MODE, ProcessIdentity, ProcessInspector, ProcessSignaler,
+        ShutdownPolicy, StopMode, SupervisorError, SupervisorTimeouts, checked_pid,
+        coherent_process_identity, connect_current_or_recover_with,
+        connect_current_or_recover_with_observer, inspect_with, open_interrupted_tombstone,
+        open_published_record, read_attested_instance, read_instance_record_with_hook,
         restart_with, retire_held_record, signal_attested_with, signal_attested_with_deadline,
         signal_identity, start_with, stop_with, wait_for_exit_until,
     };
@@ -6063,6 +6064,134 @@ mod tests {
         assert!(
             residue.is_empty(),
             "the refusal left reclaim staging behind: {residue:?}",
+        );
+        Ok(())
+    }
+
+    /// Put a state at the instance path in one step. A test that shows a reader a
+    /// half-built file cannot then claim the reader only ever saw whole ones, and
+    /// `fs::write` followed by `fs::set_permissions` is three faces rather than
+    /// one -- MEASURED with the observer below over that setup: `Some((420, 0))`
+    /// and `Some((420, 21))` from the create-then-chmod, beside the state the
+    /// setup was actually trying to arrange.
+    fn commit_at_instance(paths: &DaemonPaths, contents: &[u8], mode: u32) -> TestResult {
+        let staging = paths.directory().join(".observer-staging");
+        fs::write(&staging, contents)?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(mode))?;
+        fs::rename(&staging, paths.instance())?;
+        Ok(())
+    }
+
+    /// The reclaim path was the last in-tree producer of `(0200, content)` -- the
+    /// illegal fourth face `gascan_core::daemon_protocol` names -- because it
+    /// chmod-ed a live record and only then truncated it. This samples the
+    /// destination from another thread across many reclaim cycles and asserts the
+    /// path only ever showed a face a reader may legally see.
+    ///
+    /// Both shapes retirement is reachable with go through the loop: a published
+    /// record, which is what `recover_stale_published_record` hands it, and an
+    /// interrupted tombstone, which is what `recover_interrupted_tombstone` hands
+    /// it. The published shape is the one that carries the proof. The old
+    /// two-syscall edit chmod-ed 0600 to 0200 with the content still in place,
+    /// which is the illegal face itself; on the interrupted shape that same chmod
+    /// is a no-op, because the record already wears 0200, so that shape cannot
+    /// distinguish the two orders and is here for coverage rather than for
+    /// evidence.
+    ///
+    /// The interrupted shape's own residue is consequently in the legal set, at
+    /// exactly the length this test commits. Retirement never produced it -- the
+    /// test did, in one atomic step, because that residue is the crash state
+    /// reclaim exists to clear and it has to be at the destination for reclaim to
+    /// find it. The two payloads are asserted to be different lengths so that
+    /// admitting it cannot also admit a sighting of the published record wearing
+    /// 0200, which is what the mutation produces.
+    ///
+    /// Bounded at 64 cycles deliberately. A larger number is not stronger
+    /// evidence: this tree's record is that 47,124,057 local samples said a state
+    /// was gone and CI's first run disagreed.
+    #[test]
+    fn no_reader_ever_sees_an_illegal_state_across_reclaim() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let instance = paths.instance().to_path_buf();
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let expected = record(&executable);
+        let whole = serde_json::to_vec(&expected)?;
+        let interrupted = b"a-record-with-a-token";
+        assert_ne!(
+            whole.len(),
+            interrupted.len(),
+            "the two payloads must differ in length, or admitting the interrupted \
+             residue also admits the published record wearing 0200",
+        );
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let observer = {
+            let stop = std::sync::Arc::clone(&stop);
+            let instance = instance.clone();
+            std::thread::spawn(move || {
+                let mut seen = std::collections::BTreeSet::new();
+                while !stop.load(Ordering::Acquire) {
+                    // Yield rather than spin: this project records the workspace
+                    // suite wandering under load, and a saturated core is load.
+                    std::thread::yield_now();
+                    match fs::symlink_metadata(&instance) {
+                        // A stat whose link count is not one is not a state of this
+                        // path. `lstat` resolves a name and then reads the inode,
+                        // and those are not one step, so an observer can come away
+                        // holding the attributes of an inode the rename detached in
+                        // between. The reader draws the same line --
+                        // `is_interrupted_tombstone` requires `st_nlink == 1` and
+                        // `validate_file_stat` reports a link count that is not one
+                        // as its own distinct fault -- so a detached inode is
+                        // discarded here rather than counted as something the path
+                        // showed.
+                        Ok(metadata) if metadata.nlink() == 1 => {
+                            seen.insert(Some((
+                                metadata.permissions().mode() & 0o777,
+                                metadata.len(),
+                            )));
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            seen.insert(None);
+                        }
+                    }
+                }
+                seen
+            })
+        };
+
+        for _ in 0..64 {
+            commit_at_instance(&paths, &whole, u32::from(PRIVATE_FILE_MODE))?;
+            let held = open_published_record(&paths, &expected)?;
+            retire_held_record(&held)?;
+
+            commit_at_instance(&paths, interrupted, u32::from(INSTANCE_TOMBSTONE_MODE))?;
+            let held =
+                open_interrupted_tombstone(&paths)?.ok_or("expected an interrupted tombstone")?;
+            retire_held_record(&held)?;
+        }
+        stop.store(true, Ordering::Release);
+        let seen = observer.join().map_err(|_| "the observer panicked")?;
+
+        let tombstone = Some((u32::from(INSTANCE_TOMBSTONE_MODE), 0));
+        let published = Some((u32::from(PRIVATE_FILE_MODE), u64::try_from(whole.len())?));
+        let residue = Some((
+            u32::from(INSTANCE_TOMBSTONE_MODE),
+            u64::try_from(interrupted.len())?,
+        ));
+        let legal = [None, tombstone, published, residue];
+        let illegal: Vec<_> = seen.iter().filter(|state| !legal.contains(state)).collect();
+        assert!(
+            illegal.is_empty(),
+            "a reader saw {illegal:?}, which is neither absent, the inert tombstone, \
+             a whole record, nor the interrupted residue this test committed",
+        );
+        assert!(
+            seen.contains(&published) && seen.contains(&tombstone),
+            "the observer never sampled a real transition; it saw only {seen:?}",
         );
         Ok(())
     }
