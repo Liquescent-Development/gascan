@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use gascan_core::daemon_protocol::{
     DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_STAGING_PURPOSE, INSTANCE_TOMBSTONE_MODE,
-    LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE, SOCKET_NAME,
+    LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE, RECLAIM_STAGING_PURPOSE, SOCKET_NAME,
 };
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -473,14 +473,21 @@ where
 /// on the next lifecycle command. The rename is what created this, so the sweep
 /// belongs with the rename.
 ///
-/// Only this crate's own instance staging is swept, by prefix, and only regular
-/// files this user owns. A live daemon's staging cannot be caught: publication
-/// runs once per daemon and `prepare_socket` has already refused to start a
-/// second one against a live socket. Failure to sweep is not failure to
-/// publish -- there is nothing a caller could do about a stale file it does not
-/// own -- so this returns nothing.
+/// Only staging is swept, by prefix, and only regular files this user owns.
+/// Two processes stage here now, so the old argument -- that publication runs
+/// once per daemon and `prepare_socket` has already refused a second one -- no
+/// longer covers the set. What covers it is the lifecycle lock: the CLI stages
+/// only inside `retire_held_record`, reached from `start_with` while it holds
+/// the lock (`crates/gascan/src/daemon.rs`), and the `gascand` whose publication
+/// runs this sweep was spawned by that same locked call. A CLI staging file
+/// still at rest when this runs is therefore one no live process owns. Failure
+/// to sweep is not failure to publish -- there is nothing a caller could do
+/// about a stale file it does not own -- so this returns nothing.
 fn sweep_abandoned_staging(directory: &OwnedFd) {
-    let prefix = format!(".{INSTANCE_STAGING_PURPOSE}-");
+    let prefixes = [
+        format!(".{INSTANCE_STAGING_PURPOSE}-"),
+        format!(".{RECLAIM_STAGING_PURPOSE}-"),
+    ];
     let Ok(path) = resolved_path(directory, ".") else {
         return;
     };
@@ -492,7 +499,10 @@ fn sweep_abandoned_staging(directory: &OwnedFd) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !name.starts_with(prefix.as_str()) {
+        if !prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_str()))
+        {
             continue;
         }
         let Ok(stat) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
@@ -1215,6 +1225,40 @@ mod tests {
         assert_eq!(fs::read(&bystander)?, b"not ours to remove");
         assert!(directory.is_dir());
         assert_eq!(fs::read(&path)?, b"second");
+        drop(record);
+        Ok(())
+    }
+
+    /// The CLI stages an inert tombstone in this directory when it retires a record
+    /// it has proven dead, so a CLI killed between staging and renaming leaves a
+    /// file behind under a prefix nothing else enumerates. It holds no token -- it
+    /// is empty from birth -- so this is tidiness rather than secrecy, but the
+    /// sweeper is the only thing that enumerates this directory and it has to cover
+    /// both stagers or one of them accumulates a file per crash forever.
+    #[test]
+    fn publication_sweeps_abandoned_reclaim_staging_too() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let path = root.join("daemon-instance.json");
+        drop(super::write_instance_record(&path, b"first")?);
+
+        let abandoned = root.join(format!(".{}-BBBBBBBBBB", super::RECLAIM_STAGING_PURPOSE));
+        fs::write(&abandoned, b"")?;
+        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o200))?;
+        let bystander = root.join(".bystander");
+        fs::write(&bystander, b"not ours to remove")?;
+
+        let record = super::write_instance_record(&path, b"second")?;
+
+        assert!(
+            !abandoned.exists(),
+            "the abandoned reclaim staging survived the sweep"
+        );
+        assert!(
+            bystander.exists(),
+            "the sweep removed a file that was not staging"
+        );
         drop(record);
         Ok(())
     }
