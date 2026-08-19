@@ -11,10 +11,9 @@ instance record's publish race was fixed and merged (PR #80, #81). Everything ab
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**Item 9 is done and is in flight as a pull request on the branch
-`refactor/shared-daemon-file-protocol`. Arca is on `main` with a clean worktree.** Verify with
-`git log -1`, `git status` and `gh pr list`; do not trust a SHA in this file, which has gone
-stale on its own SHAs repeatedly.
+**Item 9 is merged. Both repositories are on `main` with clean worktrees and nothing is in
+flight.** Verify with `git log -1` and `git status`; do not trust a SHA in this file, which has
+gone stale on its own SHAs repeatedly.
 
 **No next item has been chosen. Do not pick one for yourself** — ask. Item 1's residual is the
 standing candidate and item 2c must not be decided alone; both are under `WHAT IS OPEN` below.
@@ -158,10 +157,12 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 its record is immediately below. Item 1's residual is the standing candidate for what follows
 and item 2c needs a decision rather than an implementation; both are under `WHAT IS OPEN`.
 
-### ITEM 9 IS DONE. IT IS IN FLIGHT AS A PULL REQUEST, NOT MERGED.
+### ITEM 9 IS DONE AND MERGED.
 
-**Branch `refactor/shared-daemon-file-protocol`, one commit off `main` at `3cf98b5`. Re-derive
-its head with `git log -1` rather than trusting a SHA written here.** The six duplicated
+**PR #83, merge commit `a3fef90`, a true merge — `git rev-list --parents -n1` returns three
+SHAs, `3cf98b5` and `e98dea2`. The branch was deleted after `git merge-base --is-ancestor`
+confirmed it. Re-derive every SHA here with `git log -1` rather than trusting one written in
+this file.** The six duplicated
 file-protocol values now live in `gascan_core::daemon_protocol`, and both
 `crates/gascand/src/socket.rs` and `crates/gascan/src/daemon.rs` import them.
 
@@ -229,7 +230,14 @@ spawns `sh` and `dd` and touches no daemon-protocol path at all.
 **THE RE-RUN AT `1a8d33c` WAS GREEN ON EVERYTHING** — `changes`, `contracts`, `rust` and
 `gate` all passed, `engine` skipped, run `32206399534`, with `mergeable=MERGEABLE
 mergeStateStatus=CLEAN`. The same tree, the same tests: that is what the flake looks like from
-the other side, and it is why a single red `rust` is not evidence about a branch.
+the other side, and it is why a single red `rust` is not evidence about a branch. The merged
+head `e98dea2` was green again on run `32206825905`, which is what it was merged on.
+
+**Merged `main` was verified after the fact and this one IS a clean run**, at `a3fef90`:
+`cargo fmt --all --check` exit 0, `cargo clippy --workspace --all-targets -- -D warnings` exit
+0, `cargo test --workspace` **1504 passed, 0 failed, 49 ignored**, and
+`./scripts/ci-check-ignored-tests.sh` 49 matching the baseline. Each run alone, nothing else
+running.
 
 **A CLAIM IN THIS FILE AND IN `a493cb8`'s COMMIT MESSAGE WAS WRONG AND IS CORRECTED HERE.**
 Both said `scripts/ci-classify-paths.sh` returns `contracts=false` and that `rust` was the only
@@ -344,10 +352,10 @@ alone**.
 7. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
    swapping the exit-status and timeout checks leaves the supervisor suite green.
 8. **A pre-existing stash is on the stack and is not ours.** Leave it.
-9. **DONE, AND IN FLIGHT AS A PULL REQUEST — NOT MERGED.** The six file-protocol values that
-   were declared independently in both crates now live in `gascan_core::daemon_protocol`, on the
-   branch `refactor/shared-daemon-file-protocol`. The full record, including the two results that
-   the brief for it did not anticipate, is under `ITEM 9 IS DONE` above.
+9. **DONE AND MERGED — PR #83, merge commit `a3fef90`.** The six file-protocol values that were
+   declared independently in both crates now live in `gascan_core::daemon_protocol`. The full
+   record, including the two results that the brief for it did not anticipate, is under
+   `ITEM 9 IS DONE AND MERGED` above.
 
    **What it leaves behind, and it is small but real:** the value of a shared constant is now
    guarded only by `crates/gascan-core/tests/daemon_protocol.rs`, because neither consuming
@@ -355,7 +363,8 @@ alone**.
    gascand --lib` reported 111 passed, 0 failed with `INSTANCE_TOMBSTONE_MODE` at `0o220`. The
    on-disk names hard-coded throughout `crates/gascan-e2e` were deliberately not swept, on the
    grounds that a literal in a test outside the implementing crates is the external contract
-   rather than a copy. Both judgements are reversible and neither has been reviewed yet.
+   rather than a copy. Both judgements were merged on the maintainer's standing merge-on-green
+   authorization without a separate review round, and both remain reversible.
 
 ### WHAT WAS RUN, AND WHAT CI DOES WITH IT
 
