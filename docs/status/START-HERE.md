@@ -3,9 +3,38 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Rewritten 2026-08-18 after **MILESTONE 4 MERGED.** Both pull requests are merged as true merge
-commits. Everything above the `Where the work is` heading is current; everything below it is
-history.
+Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day after the daemon
+instance record's publish race was fixed and merged (PR #80, #81). Everything above the
+`Where the work is` heading is current; everything below it is history.
+
+---
+
+## IF YOU READ NOTHING ELSE, READ THIS BLOCK
+
+**Both repositories are on `main` with clean worktrees. There is no branch to check out and
+nothing is in flight.** Verify with `git log -1` and `git status`; do not trust a SHA in this
+file, which has gone stale on its own SHAs repeatedly.
+
+**Your assignment is open item 9 and its brief is under `THE ONE THING TO DO NEXT` below.** It
+is a cross-crate constant move. **You do not need the milestone-4 design, plan, or ledger for
+it** — that table is context for the milestone that just closed, not a reading list for this
+task. The one document you must read before touching anything about *offline* is
+`docs/evidence/2026-08-18-arca-engine-offline.md`, and item 9 does not touch offline.
+
+**Four things that will bite you on this task specifically, all measured:**
+
+1. **Never run `cargo test --workspace` beside another cargo or contract job.** A solo run is
+   internally parallel too. Exonerate a failure by diff PLUS isolation, never by probability.
+2. **A green local run of any size is not proof.** 47,124,057 local samples said a state was
+   gone; CI's first run disagreed and CI was right. See trap 9.
+3. **`ps -A` sees 31 of 544 processes on this host.** An empty `ps | grep` is evidence of
+   nothing. **Never `pkill -f`** — it destroyed a session's shells once.
+4. **The SDD ledger is untracked and git-ignored deliberately. Do not commit it.**
+
+**Do not undo the headline below: the offline proof REFUTED.** `CERTIFIED_ENGINE_REVISION` stays
+`None`, the engine stays `.unverified`, and
+`crates/gascan-arca/tests/live/network.rs` FAILS BY DESIGN. Do not weaken it to make a tier
+green.
 
 ---
 
@@ -124,6 +153,61 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### THE ONE THING TO DO NEXT
 
+**YOUR ASSIGNMENT IS OPEN ITEM 9: move the six duplicated file-protocol values into
+`gascan-core` and make both crates import them.** The maintainer chose it on 2026-08-18, in
+preference to open item 1's residual, on the grounds that it is the cheapest of the open items
+and it removes a whole class of silent drift — a class this milestone has already paid for
+twice. **Start a fresh branch off `main`.**
+
+**What to move, VERIFIED by reading both files on 2026-08-18 rather than trusting this table:**
+
+| value | `crates/gascand/src/socket.rs` | `crates/gascan/src/daemon.rs` |
+|---|---|---|
+| `0o700` | `DIRECTORY_MODE` :14 | `DIRECTORY_MODE` :16 |
+| `0o600` | **`SOCKET_MODE`** :15 | **`FILE_MODE`** :17 |
+| `0o200` | `INSTANCE_TOMBSTONE_MODE` :16 | `INSTANCE_TOMBSTONE_MODE` :18 |
+| `"gascand.sock"` | `SOCKET_NAME` :18 | `SOCKET_NAME` :19 |
+| `"daemon-instance.json"` | `INSTANCE_NAME` :19 | `INSTANCE_NAME` :20 |
+| `"daemon-lifecycle.lock"` | `LIFECYCLE_LOCK_NAME` :20 | `LIFECYCLE_LOCK_NAME` :21 |
+
+**`0o600` does not share a name across the two crates, and that is the point** — `SOCKET_MODE`
+in one and `FILE_MODE` in the other. Nothing greps it up, which is how the duplicate survived
+every review this file records.
+
+**TWO CONSTANTS IN THOSE SAME BLOCKS ARE NOT SHARED AND MUST NOT BE MOVED.**
+`INSTANCE_STAGING_PURPOSE` (`socket.rs:17`) is `gascand`'s alone — it names the staging prefix
+the sweeper matches — and `STARTUP_DIAGNOSTIC_NAME` (`daemon.rs:22`) is `gascan`'s alone. They
+sit adjacent to the six and a careless block move takes them along.
+
+**FOUR MORE SITES HARD-CODE THE PROTOCOL NAMES AS STRING LITERALS** and so would not follow a
+constant that changed: `crates/gascan/src/client.rs:727`, `:730`, `:784`, `:787`
+(`"daemon-instance.json"` and `"daemon-startup-error.json"`). They are inside `#[cfg(test)]`
+code, which is exactly why they are worth fixing — **a test that hard-codes the name cannot
+fail when the constant drifts.** Sweep them in the same change.
+
+**The shared home, VERIFIED 2026-08-18:** `gascan-core` is already a path dependency of both
+(`crates/gascan/Cargo.toml:15`, `crates/gascand/Cargo.toml:10`), so this costs no new crate, and
+`gascan-core` depends on neither of them, so there is no cycle. It already carries `rustix` and
+already hosts `startup_diagnostic.rs`, which is precedent for daemon-protocol material living
+there.
+
+**Carry the three-face rule with the constants, as module documentation.** It is the strongest
+unwritten coupling in the tree and it is currently asserted by a test in `gascand` and consumed
+by a classifier in `gascan` with nothing connecting them: **the instance path shows exactly
+three faces — absent, `(0200, 0)`, and `(0600, len>0)` — and only a stat with `st_nlink == 1`
+is a state of the path at all.** Change `gascan`'s `INSTANCE_TOMBSTONE_MODE` today and
+`gascand`'s tests still pass while the classification silently breaks. That is the failure that
+cost five workspace runs and one CI run.
+
+**How to know you have actually done it:** after the move, changing a value in `gascan-core`
+must break both crates at compile time. Prove it by mutation — flip one and see both fail —
+rather than by inspection. **Do not weaken any test to make the move compile**, and do not
+rename the surviving constants to match one crate's spelling without saying which you chose and
+why.
+
+**Everything below this paragraph in this section is the record of the item that was just
+finished. It is not an assignment.**
+
 **DONE AND MERGED — PR #80, merge commit `025b922`, a true merge (`git rev-list --parents -n1`
 returns three SHAs). The branch `fix/daemon-instance-publish-race` was deleted after
 `git merge-base --is-ancestor` confirmed it.** All four CI checks passed on the merged head
@@ -144,11 +228,10 @@ baseline and 15 contracts at status 0. Verify every SHA here with `git log -1` a
 `git ls-remote`; do not trust one written in this file. Open item 1 below now records what is
 left rather than what to do, and **what is left is real** — see its residual section.
 
-**The next assignment is the maintainer's to choose, and this file does not choose it.** The
-list below is carried state. If you want a recommendation: item 1's residual (`retire_held_record`
-still walks the destination through 0200-with-content, the last in-tree producer of the state
-this milestone removed from `gascand`) is the natural continuation and is contained; item 2c is
-the one that needs a decision rather than an implementation, and **must not be decided alone**.
+**The maintainer chose item 9 on 2026-08-18 — see THE ONE THING TO DO NEXT above. Everything
+else in this list is carried state, not an assignment.** Item 1's residual is the natural
+continuation after it. Item 2c needs a decision rather than an implementation and **must not be
+decided alone**.
 
 ### WHAT IS OPEN
 
@@ -228,8 +311,10 @@ the one that needs a decision rather than an implementation, and **must not be d
 7. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
    swapping the exit-status and timeout checks leaves the supervisor suite green.
 8. **A pre-existing stash is on the stack and is not ours.** Leave it.
-9. **SIX FILE-PROTOCOL VALUES ARE DECLARED INDEPENDENTLY IN BOTH CRATES, AND ONE OF THEM DOES
-   NOT EVEN SHARE A NAME.** Found by review on 2026-08-18. `DIRECTORY_MODE` 0o700
+9. **THIS IS THE CURRENT ASSIGNMENT — the brief is under THE ONE THING TO DO NEXT above, and it
+   carries the verified table, the two constants that must NOT move, and the four hard-coded
+   literals to sweep. SIX FILE-PROTOCOL VALUES ARE DECLARED INDEPENDENTLY IN BOTH CRATES, AND
+   ONE OF THEM DOES NOT EVEN SHARE A NAME.** Found by review on 2026-08-18. `DIRECTORY_MODE` 0o700
    (`gascand/src/socket.rs:14`, `gascan/src/daemon.rs:16`); 0o600, which is `SOCKET_MODE` in one
    (`socket.rs:15`) and `FILE_MODE` in the other (`daemon.rs:17`) — **which is how a duplicate
    survives review: nothing greps it up**; `INSTANCE_TOMBSTONE_MODE` 0o200 (`:16`, `:18`);
