@@ -3267,13 +3267,25 @@ fn validate_instance_tombstone(
         device: initial_stat.st_dev as u64,
         inode: initial_stat.st_ino,
     };
+    // The name was there when `initial_stat` was taken, so its absence now is a
+    // successor having unlinked the tombstone between two of our looks -- a race,
+    // not a fault. Only `ENOENT` says that: `ELOOP` means the name was replaced
+    // by a symlink, `EACCES` means the directory stopped letting us in, and every
+    // other errno is a real failure. Those stay terminal, which is the direction
+    // that fails closed.
     let fd = rustix::fs::openat(
         directory,
         name,
         OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(errno)?;
+    .map_err(|error| {
+        if error == rustix::io::Errno::NOENT {
+            raced("the daemon instance tombstone was unlinked while validating it")
+        } else {
+            errno(error)
+        }
+    })?;
     let opened = rustix::fs::fstat(&fd).map_err(errno)?;
     if !is_instance_tombstone(&opened, expected_uid)
         || (FileIdentity {
@@ -8471,6 +8483,34 @@ mod tests {
             observations.load(AtomicOrdering::SeqCst),
             3,
             "every observation is spent before the reader gives up"
+        );
+        Ok(())
+    }
+
+    /// `clear_inert_destination` in `crates/gascand/src/socket.rs` unlinks the
+    /// tombstone, so this `openat` can return `ENOENT` where it could not before
+    /// the publish-race fix. `read_instance_record_for_inspection` maps `NotFound`
+    /// to `Ok(None)` and is unaffected; `read_attested_instance` propagates it,
+    /// and it has no non-test callers yet. Classifying it now removes a trap from
+    /// whoever wires it rather than leaving one.
+    #[test]
+    fn a_tombstone_that_vanishes_between_looks_is_a_race_not_a_fault() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        write_inert_tombstone(paths.instance(), u32::from(INSTANCE_TOMBSTONE_MODE))?;
+
+        let (parent, name) = super::instance_parent_and_name(paths.instance())?;
+        let directory = super::open_private_directory_with_mode(parent, paths.expected_uid, false)?;
+        let stat = rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        fs::remove_file(paths.instance())?;
+
+        let error = super::validate_instance_tombstone(&directory, name, &stat, paths.expected_uid)
+            .err()
+            .ok_or("a vanished tombstone must not validate")?;
+        assert!(
+            is_raced(&error),
+            "a successor unlinking the tombstone is a race, not a fault: {error}"
         );
         Ok(())
     }
