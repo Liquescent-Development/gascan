@@ -995,13 +995,19 @@ async fn probe_authenticated<E: DaemonEndpoint>(
 /// Observations of a path two processes share disagree sometimes, and a
 /// disagreement is not by itself a fault. `start_with` takes the lifecycle lock
 /// and `inspect` does not, so a status check can sample the record while a
-/// legitimate stop is rewriting it; every such disagreement used to be a
-/// terminal `DaemonState::Unsafe`, which is a verdict whose other members are
-/// symlink attacks and foreign ownership.
+/// legitimate stop is rewriting it, and `DaemonState::Unsafe` is a verdict
+/// whose other members are symlink attacks and foreign ownership.
 ///
-/// So a race-shaped failure is looked at again rather than believed. Three
-/// observations, because the windows this races with are a rename wide and one
-/// retry already clears them -- the third is margin, not expectation.
+/// So a race-shaped failure is looked at again rather than believed -- five of
+/// them: the three in `validate_instance_tombstone` and the two in
+/// `open_published_record`. The other "changed while ..." failures in this file
+/// are still terminal, as are the `validate_file_stat` faults and the `EACCES`
+/// that a 0200 path returns -- which is what the common published-to-inert
+/// transition reaches instead of `open_published_record`'s two marks.
+/// `docs/status/START-HERE.md` records that residue.
+///
+/// Three observations, because the windows this races with are a rename wide
+/// and one retry already clears them -- the third is margin, not expectation.
 ///
 /// The lifecycle lock does not make this unnecessary under `start_with`. What
 /// that lock fences is the other CLI lifecycle callers; `gascand` publishes its
@@ -1022,10 +1028,40 @@ where
     E: DaemonEndpoint,
     P: ProcessInspector,
 {
+    inspect_with_hook(paths, expected_executable, endpoint, inspector, || Ok(())).await
+}
+
+/// The retry composed with the observation, with the observation's tombstone
+/// window exposed.
+///
+/// The composition is the whole feature: `retry_while_raced` and the `raced()`
+/// marks are each provable on their own, and neither reaches a user unless this
+/// line stands. A test drives a race through here so that collapsing it back to
+/// a single observation fails something. `Fn` rather than `FnOnce` because the
+/// retry rebuilds the observation on every attempt, which is what lets a hook
+/// fire on the first one and stand aside afterwards.
+async fn inspect_with_hook<E, P, F>(
+    paths: &DaemonPaths,
+    expected_executable: &Path,
+    endpoint: &E,
+    inspector: &P,
+    before_tombstone_validation: F,
+) -> Result<Inspection<E::Connection>, SupervisorError>
+where
+    E: DaemonEndpoint,
+    P: ProcessInspector,
+    F: Fn() -> io::Result<()>,
+{
     const OBSERVATIONS: u32 = 3;
 
     retry_while_raced(DEFAULT_POLL, OBSERVATIONS, || {
-        observe_once(paths, expected_executable, endpoint, inspector)
+        observe_once_with_hook(
+            paths,
+            expected_executable,
+            endpoint,
+            inspector,
+            &before_tombstone_validation,
+        )
     })
     .await
 }
@@ -1074,19 +1110,6 @@ where
         published_record: None,
         raced: None,
     })
-}
-
-async fn observe_once<E, P>(
-    paths: &DaemonPaths,
-    expected_executable: &Path,
-    endpoint: &E,
-    inspector: &P,
-) -> Result<Inspection<E::Connection>, SupervisorError>
-where
-    E: DaemonEndpoint,
-    P: ProcessInspector,
-{
-    observe_once_with_hook(paths, expected_executable, endpoint, inspector, || Ok(())).await
 }
 
 /// One observation, with the record read's tombstone window exposed.
@@ -3212,7 +3235,7 @@ where
         // taken, and the name can be renamed over before the validator opens it.
         // Production passes a no-op here; a test passes the rename, which is the
         // only way a `raced()` failure from that validator can be driven through
-        // `observe_once` without a second thread and a clock.
+        // `observe_once_with_hook` without a second thread and a clock.
         before_tombstone_validation()?;
         validate_instance_tombstone(&directory, name, &initial_stat, paths.expected_uid)?;
         return Ok(None);
@@ -3443,11 +3466,12 @@ fn is_raced(error: &io::Error) -> bool {
         .is_some_and(|inner| inner.is::<RacedObservation>())
 }
 
-/// The marker `observe_once` hangs on an `Inspection` it built from a failure,
-/// so that `retry_while_raced` can tell "the file moved while I looked" from
-/// "the file is wrong". Written once because every `Unsafe` verdict built from
-/// an `io::Error` inside `observe_once` must make the same judgement, and one of
-/// them silently deciding otherwise is the bug this retry exists to fix.
+/// The marker `observe_once_with_hook` hangs on an `Inspection` it built from a
+/// failure, so that `retry_while_raced` can tell "the file moved while I looked"
+/// from "the file is wrong". Written once because every `Unsafe` verdict built
+/// from an `io::Error` inside `observe_once_with_hook` must make the same
+/// judgement, and one of them silently deciding otherwise is the bug this retry
+/// exists to fix.
 fn race_marker(error: &io::Error) -> Option<String> {
     is_raced(error).then(|| error.to_string())
 }
@@ -3997,10 +4021,11 @@ mod tests {
         ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode, SupervisorError,
         SupervisorTimeouts, checked_pid, coherent_process_identity,
         connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
-        is_raced, observe_once_with_hook, open_interrupted_tombstone, open_published_record,
-        race_marker, raced, read_attested_instance, read_instance_record_with_hook, restart_with,
-        retire_held_record, retry_while_raced, signal_attested_with, signal_attested_with_deadline,
-        signal_identity, start_with, stop_with, wait_for_exit_until,
+        inspect_with_hook, is_raced, observe_once_with_hook, open_interrupted_tombstone,
+        open_published_record, race_marker, raced, read_attested_instance,
+        read_instance_record_with_hook, restart_with, retire_held_record, retry_while_raced,
+        signal_attested_with, signal_attested_with_deadline, signal_identity, start_with,
+        stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
     use super::{inspect_process_with, parse_lsof_executable};
@@ -8371,8 +8396,8 @@ mod tests {
         assert!(!is_raced(&io::Error::from(io::ErrorKind::NotFound)));
     }
 
-    /// The wiring every `Unsafe` verdict that `observe_once` builds from an
-    /// `io::Error` uses: the detail is the message, and the retry marker is
+    /// The wiring every `Unsafe` verdict that `observe_once_with_hook` builds
+    /// from an `io::Error` uses: the detail is the message, and the retry marker is
     /// whatever `race_marker` makes of the error. The retry tests build their
     /// observations through this rather than setting `raced` by hand, so that a
     /// change to `is_raced` reaches them instead of passing underneath them.
@@ -8535,7 +8560,7 @@ mod tests {
     /// `Err(PermissionDenied, raced)` classified -- so a daemon that is partway
     /// through publishing stops reading as absent, which is the reading that
     /// yields `Stopped` and could send a caller off to start a second one, and
-    /// becomes a failure `observe_once` can see and look at again.
+    /// becomes a failure `observe_once_with_hook` can see and look at again.
     /// `read_attested_instance` propagates the same error and has no non-test
     /// callers yet.
     #[test]
@@ -8603,8 +8628,9 @@ mod tests {
     /// A failure nobody classified is the verdict on the first observation and is
     /// never looked at again. That is the fail-closed default, and `is_raced` is
     /// the only thing separating it from a retry -- so this drives a real
-    /// unclassified `io::Error` through the same wiring `observe_once` uses,
-    /// which is what makes it fail if `is_raced` ever starts saying yes.
+    /// unclassified `io::Error` through the same wiring
+    /// `observe_once_with_hook` uses, which is what makes it fail if `is_raced`
+    /// ever starts saying yes.
     #[tokio::test]
     async fn an_unclassified_failure_is_the_verdict_on_the_first_observation() -> TestResult {
         let unsafe_file = io::Error::new(
@@ -8636,12 +8662,12 @@ mod tests {
     /// validator has to reach the `Inspection` as a marker, or the retry above is
     /// dead code no matter how well it is tested on its own.
     ///
-    /// This drives that join through `observe_once` with a real race: the instance
-    /// path is an inert tombstone, and the hook renames a *different* tombstone
-    /// over the name in the window between the record read's `statat` and
-    /// `validate_instance_tombstone`'s `openat` -- the same substitution a
-    /// publisher's rename makes, sequenced synchronously inside one thread so no
-    /// clock decides the outcome.
+    /// This drives that join through `observe_once_with_hook` with a real race:
+    /// the instance path is an inert tombstone, and the hook renames a
+    /// *different* tombstone over the name in the window between the record
+    /// read's `statat` and `validate_instance_tombstone`'s `openat` -- the same
+    /// substitution a publisher's rename makes, sequenced synchronously inside
+    /// one thread so no clock decides the outcome.
     ///
     /// `open_interrupted_tombstone` then reports `Ok(None)`, because the
     /// replacement is empty and an interrupted record has content, so the verdict
@@ -8691,6 +8717,51 @@ mod tests {
         let inspected =
             observe_once_with_hook(&paths, &executable, &endpoint, &inspector, || Ok(())).await?;
 
+        assert_eq!(inspected.status.state, DaemonState::Stopped);
+        assert_eq!(inspected.raced_detail(), None);
+        Ok(())
+    }
+
+    /// The composition, which nothing else here reaches. The retry is proved
+    /// from canned observations and the marking is proved from the filesystem,
+    /// and both proofs hold just as well if the two are never joined -- so
+    /// collapsing `inspect_with_hook` to a single `observe_once_with_hook`, or
+    /// dropping `OBSERVATIONS` to 1, has to fail something, and this is it.
+    ///
+    /// The substitution is the one
+    /// `a_raced_validator_failure_reaches_the_inspection_as_a_marker` makes, and
+    /// the hook counts its own calls so that it fires on the first observation
+    /// and stands aside on the second. No thread and no clock decide which
+    /// observation is which; `DEFAULT_POLL` is slept through, not raced against.
+    #[tokio::test]
+    async fn a_raced_observation_is_looked_at_again_through_inspect_with() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        let tombstone_mode = u32::from(INSTANCE_TOMBSTONE_MODE);
+        write_inert_tombstone(paths.instance(), tombstone_mode)?;
+
+        let instance = paths.instance().to_path_buf();
+        let observations = std::cell::Cell::new(0u32);
+        let inspected = inspect_with_hook(&paths, &executable, &endpoint, &inspector, || {
+            observations.set(observations.get() + 1);
+            if observations.get() > 1 {
+                return Ok(());
+            }
+            let staged = instance.with_extension("staged");
+            write_inert_tombstone(&staged, tombstone_mode)?;
+            fs::rename(&staged, &instance)
+        })
+        .await?;
+
+        assert_eq!(
+            observations.get(),
+            2,
+            "a raced observation must be taken again, and the settled one must end it"
+        );
         assert_eq!(inspected.status.state, DaemonState::Stopped);
         assert_eq!(inspected.raced_detail(), None);
         Ok(())
