@@ -2877,8 +2877,7 @@ fn open_published_record(
     let file = File::from(fd);
     let actual_record = read_record_from_held_file(&file, size)?;
     if &actual_record != expected_record {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(raced(
             "daemon instance record changed while binding its descriptor",
         ));
     }
@@ -2891,8 +2890,7 @@ fn open_published_record(
     }) != identity
         || rechecked.st_size as u64 != size
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(raced(
             "daemon instance path changed while binding its descriptor",
         ));
     }
@@ -3107,10 +3105,7 @@ fn validate_instance_tombstone(
             inode: opened.st_ino,
         }) != expected
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "daemon instance tombstone changed while opening it",
-        ));
+        return Err(raced("daemon instance tombstone changed while opening it"));
     }
     let rechecked =
         rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
@@ -3120,8 +3115,7 @@ fn validate_instance_tombstone(
             inode: rechecked.st_ino,
         }) != expected
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(raced(
             "daemon instance tombstone changed while validating it",
         ));
     }
@@ -3218,6 +3212,41 @@ fn validate_inert_endpoint(paths: &DaemonPaths) -> io::Result<()> {
 pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+/// A failure that says the reader looked at a moving target, not that it found
+/// something wrong.
+///
+/// It rides inside `io::Error` so that every validator keeps returning
+/// `io::Result` and no signature changes -- and so that the default is
+/// fail-closed. Only a failure built by [`raced`] is retryable; anything else,
+/// including anything a future validator invents, stays terminal.
+#[derive(Debug)]
+struct RacedObservation {
+    detail: String,
+}
+
+impl std::fmt::Display for RacedObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for RacedObservation {}
+
+fn raced(detail: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        RacedObservation {
+            detail: detail.to_owned(),
+        },
+    )
+}
+
+fn is_raced(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<RacedObservation>())
 }
 
 fn instance_parent_and_name(path: &Path) -> io::Result<(&Path, &OsStr)> {
@@ -3762,10 +3791,10 @@ mod tests {
         OsProcessInspector, PRIVATE_FILE_MODE, ProcessIdentity, ProcessInspector, ProcessSignaler,
         ShutdownPolicy, StopMode, SupervisorError, SupervisorTimeouts, checked_pid,
         coherent_process_identity, connect_current_or_recover_with,
-        connect_current_or_recover_with_observer, inspect_with, open_interrupted_tombstone,
-        open_published_record, read_attested_instance, read_instance_record_with_hook,
-        restart_with, retire_held_record, signal_attested_with, signal_attested_with_deadline,
-        signal_identity, start_with, stop_with, wait_for_exit_until,
+        connect_current_or_recover_with_observer, inspect_with, is_raced,
+        open_interrupted_tombstone, open_published_record, raced, read_attested_instance,
+        read_instance_record_with_hook, restart_with, retire_held_record, signal_attested_with,
+        signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
     use super::{inspect_process_with, parse_lsof_executable};
@@ -8082,5 +8111,19 @@ mod tests {
             "a mode that is not a tombstone at all keeps the plain fault: {plainly_wrong}"
         );
         Ok(())
+    }
+
+    /// Transience is carried in the error's payload rather than in its kind,
+    /// because the kind is already load-bearing and because this way the default is
+    /// the safe one: an error built any other way is terminal, so a validator added
+    /// later that nobody classifies stays `Unsafe` until a human decides otherwise.
+    #[test]
+    fn only_explicitly_raced_failures_are_retryable() {
+        assert!(is_raced(&raced("the tombstone changed while opening it")));
+        assert!(!is_raced(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "protected runtime file is unsafe: not a regular file",
+        )));
+        assert!(!is_raced(&io::Error::from(io::ErrorKind::NotFound)));
     }
 }
