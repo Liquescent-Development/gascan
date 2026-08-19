@@ -476,13 +476,37 @@ where
 /// Only staging is swept, by prefix, and only regular files this user owns.
 /// Two processes stage here now, so the old argument -- that publication runs
 /// once per daemon and `prepare_socket` has already refused a second one -- no
-/// longer covers the set. What covers it is the lifecycle lock: the CLI stages
-/// only inside `retire_held_record`, reached from `start_with` while it holds
-/// the lock (`crates/gascan/src/daemon.rs`), and the `gascand` whose publication
-/// runs this sweep was spawned by that same locked call. A CLI staging file
-/// still at rest when this runs is therefore one no live process owns. Failure
-/// to sweep is not failure to publish -- there is nothing a caller could do
-/// about a stale file it does not own -- so this returns nothing.
+/// longer covers the set.
+///
+/// What the lifecycle lock fences is this. In `crates/gascan/src/daemon.rs`,
+/// the CLI stages only inside `retire_held_record`, which is reached only from
+/// `recover_interrupted_tombstone` and `recover_stale_published_record`, and
+/// those only from `ensure_started_locked`. That function has three callers --
+/// `start_with`, `restart_with`, and
+/// `connect_current_or_recover_with_observer`, the auto-start path an ordinary
+/// data command takes -- and each one takes the lifecycle lock before the call
+/// and holds it across the whole of it. On the success path the spawning call
+/// still holds that lock when the daemon it spawned publishes, so a CLI's
+/// staging and this sweep cannot interleave.
+///
+/// The fence does not cover every `gascand`, and the residue is named here
+/// rather than argued away. `ensure_started_locked` spawns detached and then
+/// waits: on a readiness deadline it returns `SupervisorError::Readiness` and
+/// its caller's lock drops while the spawned daemon may still be coming up, so
+/// that daemon publishes and sweeps with no lock held by anyone. A `gascand`
+/// need not have been CLI-spawned at all -- `write_daemon_instance_record`
+/// mints its own token when the environment supplies none
+/// (`crates/gascand/src/api.rs`) -- so a hand-launched or service-managed
+/// daemon sweeps outside the lock entirely. Either sweep can reach a
+/// `.reclaim-` file a CLI is staging under the lock at that moment.
+///
+/// The cost of that is a failed rename of an empty file. The reclaim staging
+/// file is empty from birth and carries no token, so nothing leaks -- unlike
+/// this crate's own staging, which holds a complete record, and which is why
+/// the sweeper exists at all.
+///
+/// Failure to sweep is not failure to publish -- there is nothing a caller
+/// could do about a stale file it does not own -- so this returns nothing.
 fn sweep_abandoned_staging(directory: &OwnedFd) {
     let prefixes = [
         format!(".{INSTANCE_STAGING_PURPOSE}-"),
