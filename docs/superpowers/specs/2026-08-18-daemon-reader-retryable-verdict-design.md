@@ -170,9 +170,24 @@ The replacement checks two distinct identities:
 - the **name** resolves to the freshly staged inode, wearing the inert face
 - the **held** inode has `st_size == 0` and `st_nlink == 0`
 
-That is a strictly stronger post-condition than today's. Today proves one inode reached
-`(0200, 0)`. The replacement proves the record is gone from the namespace *and* its bytes are
-destroyed *and* what replaced it is legal.
+**Corrected: this section first called that "a strictly stronger post-condition than today's",
+and it is not.** It is a trade — stronger in two dimensions, weaker in one.
+
+Stronger: the replacement proves the record is gone from the namespace, *and* that its bytes are
+destroyed, *and* that what stands at the name is legal. The old form proved only that one inode
+reached `(0200, 0)`; it never proved the bytes were unreachable, because the inode was still
+linked at the name when it was checked.
+
+Weaker: the old form proved the inode at the name was the very inode the recovery had validated.
+The replacement cannot, and must not try — the rename is not `NOREPLACE`, because replacing is
+the whole job, so it overwrites whatever stands at the name at that instant and nothing
+downstream can tell that it did.
+
+What restores that dimension is a separate check rather than a post-condition:
+`retire_held_record` compares the destination against `record.identity` immediately *before* the
+`renameat`, and refuses with `TombstoneChanged` if the name has stopped naming the record this
+retirement validated. Post-conditions cannot recover it after the fact; only a check-then-act on
+the near side of the rename can.
 
 ## 4. The reader: a retryable verdict
 
@@ -203,13 +218,41 @@ size recheck mismatches; and the `ENOENT` that `gascand`'s `clear_inert_destinat
 (`crates/gascand/src/socket.rs:530`) made newly reachable, which surfaces at the `openat` in
 `validate_instance_tombstone` (`crates/gascan/src/daemon.rs:2855`).
 
-That last one closes the third piece of open item 1's residual, recorded as reachable-but-inert
-because `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)` and only
-`read_attested_instance` propagates it, which has no non-test callers — VERIFIED 2026-08-18,
-every caller is inside the test module. Handling it here costs nothing and removes a trap from
-whoever wires `read_attested_instance` later.
+That last one closes the third piece of open item 1's residual.
+
+**Corrected, and the correction runs the other way from the claim it replaces.** This section
+first called that `ENOENT` "reachable but inert in production", reasoning that
+`read_instance_record_for_inspection` maps `NotFound` to `Ok(None)` and that only
+`read_attested_instance` propagates it, which has no non-test callers. The second half still
+holds — every call site sits inside `mod tests`; re-derive it with
+`grep -n read_attested_instance crates/gascan/src/daemon.rs` and compare against the line
+`mod tests {` opens on, rather than trusting a line number written here. The first half is
+backwards: `raced()` builds a `PermissionDenied`, not a `NotFound`, so classifying this failure
+is exactly what stops `read_instance_record_for_inspection`'s `NotFound => Ok(None)` arm from
+matching, and the failure propagates instead of being swallowed.
+
+MEASURED on 2026-08-19 at `beb05f4` with a temporary probe — not in the tree — calling
+`read_instance_record_for_inspection_with_hook` with a `before_tombstone_validation` hook that
+unlinks the tombstone: with the classification present, `Err(kind=PermissionDenied, raced=true)`;
+with the `raced(...)` arm reverted to `errno(error)`, `Ok(None)`.
+
+So the window changes from a silent "no record" — the reading that yields a `Stopped` verdict
+for a daemon that is in fact coming up — into a failure `observe_once` can look at again. That
+is a statement about this reader's return value and the arm it feeds. **No end-to-end verdict
+flip was tested**, and none is claimed here.
 
 Terminal: everything else, including `(0200, content)` per §2.4.
+
+**Knowingly left, and recorded rather than silently dropped.** The split covers the `openat` in
+`validate_instance_tombstone` and not the recheck `statat` further down the same function, whose
+`ENOENT` stays unmarked and terminal. The exposure is characterised, not assumed:
+`openat`→`fstat` is already covered, because an unlink in that window leaves `st_nlink == 0`,
+`is_instance_tombstone` fails, and the existing raced mark fires; what is left is
+`fstat`→recheck-`statat`, and within that only the sub-window between a successor's `unlinkat`
+and its `renameat_with`. Narrow, real, and fail-closed today — the cost is an unflattering
+`Unsafe` where a retry would have settled it, not a wrong action. The durable home for this is
+open item 1 in `docs/status/START-HERE.md`; it is repeated here because this is the section
+someone extending the split will read.
 
 ## 5. What moves to `gascan-core`
 

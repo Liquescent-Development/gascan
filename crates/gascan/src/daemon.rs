@@ -1785,8 +1785,14 @@ fn retire_held_record(record: &InterruptedTombstone) -> Result<(), SupervisorErr
 /// `cargo test -p gascan --lib -- tombstone_recovery_ stale_record_recovery_
 /// retirement_replaces`: 8 passed, 0 failed. That filter selected eight tests
 /// when the measurement was taken; the ninth arrived later, with the pre-rename
-/// identity check in `retire_held_record`. The difference is only visible to
-/// a concurrent reader during the window, which no test in this tree opens. So
+/// identity check in `retire_held_record`. The difference is only visible to a
+/// concurrent reader during the window, and there is now one test that opens it:
+/// `no_reader_ever_sees_an_illegal_state_across_reclaim`. MEASURED on 2026-08-19
+/// at `beb05f4` by inserting `rustix::fs::ftruncate(&record.file, 0)`
+/// immediately above the `renameat` in `retire_held_record` and running
+/// `cargo test -p gascan --lib no_reader_ever_sees_an_illegal_state_across_reclaim`:
+/// FAILED, `a reader saw [Some((384, 0))]` -- `0o600` at size zero, the
+/// published-record-of-size-zero this ordering exists to keep off the path. So
 /// the precondition is checked at the moment it matters, and travels with the
 /// syscall it guards rather than sitting beside it where a later edit can
 /// separate them.
@@ -3686,8 +3692,10 @@ fn file_identity_at(
 /// destination, and empties the record only once the rename has taken it out of
 /// the namespace, so it mutates nothing that anyone can still reach by name.
 ///
-/// So the only reachable producer left is a `gascand` older than the change
-/// above. **Not** a daemon that dies mid-publish — under the new publisher that
+/// So the only producer left in production code is a `gascand` older than the
+/// change above — the one producer this workspace cannot fix by editing it,
+/// which is why this fault stays terminal instead of becoming a retry. **Not**
+/// a daemon that dies mid-publish — under the new publisher that
 /// leaves the destination absent and the half-written record under a staging
 /// name, which is a different failure with a different cure. **Not** the CLI's
 /// retirement, whose ordering is the mirror of the publisher's and is argued at
@@ -6307,9 +6315,16 @@ mod tests {
     /// Put a state at the instance path in one step. A test that shows a reader a
     /// half-built file cannot then claim the reader only ever saw whole ones, and
     /// `fs::write` followed by `fs::set_permissions` is three faces rather than
-    /// one -- MEASURED with the observer below over that setup: `Some((420, 0))`
-    /// and `Some((420, 21))` from the create-then-chmod, beside the state the
-    /// setup was actually trying to arrange.
+    /// one -- MEASURED on 2026-08-18, while `9b8cf22` was being written, by running
+    /// `no_reader_ever_sees_an_illegal_state_across_reclaim` below over an
+    /// `fs::write`-then-`fs::set_permissions` setup: the observer sampled
+    /// `Some((420, 0))` and `Some((420, 21))` from the create-then-chmod, beside
+    /// the state the setup was trying to arrange.
+    ///
+    /// Both of those sightings are readings of that machine, not constants: the
+    /// mode is `fs::write`'s `0666` masked by the running process's umask (`420`
+    /// is `0o644`, i.e. umask `022`) and the size is whatever payload was passed.
+    /// The shape of the defect is what carries over; the numbers do not.
     fn commit_at_instance(paths: &DaemonPaths, contents: &[u8], mode: u32) -> TestResult {
         let staging = paths.directory().join(".observer-staging");
         fs::write(&staging, contents)?;
@@ -6318,16 +6333,22 @@ mod tests {
         Ok(())
     }
 
-    /// The reclaim path was the last in-tree producer of `(0200, content)` -- the
-    /// illegal fourth face `gascan_core::daemon_protocol` names -- because it
-    /// chmod-ed a live record and only then truncated it. This samples the
-    /// destination from another thread across many reclaim cycles and asserts the
-    /// path only ever showed a face a reader may legally see.
+    /// The reclaim path was the last producer of `(0200, content)` in this
+    /// workspace's production code -- the illegal fourth face
+    /// `gascan_core::daemon_protocol` names -- because it chmod-ed a live record
+    /// and only then truncated it. (Test fixtures still fabricate that face on
+    /// purpose, this one included; see `commit_at_instance` above and
+    /// `DelayedPublicationSpawner`.) This samples the destination from another
+    /// thread across many reclaim cycles and asserts the path only ever showed a
+    /// legal face, or the interrupted residue this test itself committed for
+    /// reclaim to find.
     ///
     /// Both shapes retirement is reachable with go through the loop: a published
     /// record, which is what `recover_stale_published_record` hands it, and an
     /// interrupted tombstone, which is what `recover_interrupted_tombstone` hands
-    /// it. The published shape is the one that carries the proof. The old
+    /// it. Neither caller runs here -- the shapes are constructed the way those
+    /// callers hand them over. The published shape is the one that carries the
+    /// proof. The old
     /// two-syscall edit chmod-ed 0600 to 0200 with the content still in place,
     /// which is the illegal face itself; on the interrupted shape that same chmod
     /// is a no-op, because the record already wears 0200, so that shape cannot
@@ -6344,7 +6365,23 @@ mod tests {
     ///
     /// Bounded at 64 cycles deliberately. A larger number is not stronger
     /// evidence: this tree's record is that 47,124,057 local samples said a state
-    /// was gone and CI's first run disagreed.
+    /// was gone and CI's first run disagreed. That measurement is not this test's
+    /// and is not restated here -- it is held with its anchor at
+    /// `crates/gascand/src/socket.rs`, in the truncate-before-chmod comment
+    /// inside `retire_instance_record_with_hook`, which cites `add3c13`,
+    /// `no_reader_ever_sees_an_illegal_state_across_start_and_stop` and the
+    /// sighting CI produced.
+    ///
+    /// MEASURED on 2026-08-19 at `beb05f4`, by replacing the body of
+    /// `retire_held_record` with the old two syscalls -- `fchmod` to
+    /// `INSTANCE_TOMBSTONE_MODE` then `ftruncate`, on the held record, no staging
+    /// and no rename -- and running
+    /// `cargo test -p gascan --lib no_reader_ever_sees_an_illegal_state_across_reclaim`:
+    /// FAILED, `a reader saw [Some((128, 341))]`. `128` is `0o200`; `341` is the
+    /// serialised record's length **on that machine**, because the record embeds
+    /// `std::env::current_exe()`, so re-deriving this elsewhere gives a different
+    /// second number. The test does not depend on it -- `published` is computed
+    /// from `whole.len()` at run time.
     #[test]
     fn no_reader_ever_sees_an_illegal_state_across_reclaim() -> TestResult {
         let temp = tempfile::tempdir()?;

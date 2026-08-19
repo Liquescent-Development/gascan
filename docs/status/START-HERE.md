@@ -4,21 +4,28 @@ This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
 Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day after the daemon
-instance record's publish race was fixed and merged (PR #80, #81). Everything above the
-`Where the work is` heading is current; everything below it is history.
+instance record's publish race was fixed and merged (PR #80, #81). Updated again 2026-08-19,
+from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
+retryable verdict — was implemented there; that branch was **not merged** when this was written.
+Everything above the `Where the work is` heading is current; everything below it is history.
 
 ---
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**Item 9 is merged. Both repositories are on `main` with clean worktrees and nothing is in
-flight.** Verify with `git log -1` and `git status`; do not trust a SHA in this file, which has
-gone stale on its own SHAs repeatedly.
+**Item 9 is merged. Open item 1's residual — the reader's half of the daemon instance record —
+is implemented on branch `fix/daemon-reader-retryable-verdict`, which is IN FLIGHT: not merged,
+not pushed at the time this was written.** Verify with `git log -1`, `git status` and
+`git branch -a`; do not trust a SHA or a branch state written in this file, both of which have
+gone stale here repeatedly.
 
-**Your assignment is open item 1's residual: the reader's half of the daemon instance record.**
-The maintainer chose it on 2026-08-18. Its brief is under `THE ONE THING TO DO NEXT` below.
-Item 2c is no longer an open decision — it was decided the same day and is now an unstarted
-implementation with a specified shape.
+**If that branch is still unmerged, finishing it is the assignment**: review, merge, and then
+carry the one knowingly-left follow-up recorded at the end of open item 1 — the unmarked,
+terminal `ENOENT` on the recheck `statat` in `validate_instance_tombstone`. **If it is merged,
+the next assignment is the maintainer's to choose**; item 2c is the obvious candidate and is
+**decided but unbuilt** — the product question was ruled on 2026-08-18 and must not be
+re-litigated, but nothing has been implemented and the engineering questions under open item 2
+are still open.
 **You do not need the milestone-4 design, plan, or ledger** — that table is context for the
 milestone that closed, not a reading list. The one document you must read before touching
 anything about *offline* is `docs/evidence/2026-08-18-arca-engine-offline.md`.
@@ -155,27 +162,29 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### THE ONE THING TO DO NEXT
 
-**YOUR ASSIGNMENT IS OPEN ITEM 1'S RESIDUAL: THE READER HAS NO RETRYABLE VERDICT.** The
-maintainer chose it on 2026-08-18, over fixing the CI flakes and over the four small gaps,
-because it is a wrong answer a user can actually see. Item 9 is done and merged; its record is
-immediately below. The full statement of what is left is under `WHAT IS OPEN` item 1.
+**THAT ASSIGNMENT — OPEN ITEM 1'S RESIDUAL, "THE READER HAS NO RETRYABLE VERDICT" — WAS
+EXECUTED.** The maintainer chose it on 2026-08-18 over fixing the CI flakes and over the four
+small gaps, because it was a wrong answer a user could actually see. It is implemented on branch
+`fix/daemon-reader-retryable-verdict` off base `3cf98b5`, in eight reviewed tasks (more commits
+than that — count them with `git log --oneline main..fix/daemon-reader-retryable-verdict`, do not
+trust a number written here), **and that branch is not merged.** The full record of what changed, what it measured, and the one thing it knowingly
+left is under `WHAT IS OPEN` item 1 — read that, not this summary.
 
-**The user-visible shape of it, VERIFIED 2026-08-18 by reading the code rather than the
-tracker:** `start_with` takes the lifecycle lock (`crates/gascan/src/daemon.rs:1161`) and
-`inspect` does not (`:1969`), so a `gascan status` run concurrently with a legitimate stop can
-sample the record mid-transition. Every disagreement between two of the reader's observations
-is terminal — `validate_instance_tombstone` returns a terminal `PermissionDenied` if a
-successor published in between, and `open_published_record` reports a legitimate concurrent
-stop as `Unsafe`. None of them is retryable. The job is to teach the reader the difference
-between "I raced with a normal transition" and "something is actually wrong".
+**The shape it had, kept because it is what the fix is answering:** `start_with` takes the
+lifecycle lock and `inspect` does not, so a `gascan status` run concurrently with a legitimate
+stop can sample the record mid-transition. Every disagreement between two of the reader's
+observations was terminal — `validate_instance_tombstone` returned a terminal `PermissionDenied`
+if a successor published in between, and `open_published_record` reported a legitimate concurrent
+stop as `Unsafe`. The job was to teach the reader the difference between "I raced with a normal
+transition" and "something is actually wrong", and the answer was a marker on race-shaped
+failures plus a retry of the whole observation sequence, terminal by default.
 
-**The known hard part, and it is why this was not folded into the publish-race fix:**
-`retire_held_record` (`crates/gascan/src/daemon.rs:1456-1460`, `fchmod(0200)` then
-`ftruncate(0)`, VERIFIED still in that order) cannot simply be staged-and-renamed like the
-publisher was, because `validate_retired_tombstone` requires the held descriptor's inode to
-still be *at the name* and a rename unlinks it. Changing that is a design change to the reclaim
-protocol. **Brainstorm the design before writing code, and do not weaken
-`validate_retired_tombstone` to make a rename fit.**
+**The known hard part was real and is where the design went.** `retire_held_record` could not
+simply be staged-and-renamed like the publisher was, because `validate_retired_tombstone`
+required the held descriptor's inode to still be *at the name* and a rename unlinks it. It was
+not weakened to make a rename fit: it was rewritten against two identities, and the one guarantee
+that rewrite could not keep — that the inode at the name is the one the recovery validated — was
+restored by a separate check-then-act immediately before the rename. Open item 1 has the detail.
 
 ### ITEM 9 IS DONE AND MERGED.
 
@@ -191,10 +200,19 @@ deliberate.** It was `SOCKET_MODE` in `gascand` and `FILE_MODE` in `gascan`, and
 covers four things: the socket, the published instance record, the lifecycle lock and the
 startup diagnostic. Each old name was true of one of the four. The other five kept their names.
 
-**The two adjacent constants did not move.** `INSTANCE_STAGING_PURPOSE` stayed in `socket.rs`
-and `STARTUP_DIAGNOSTIC_NAME` stayed in `daemon.rs`, each now carrying a comment saying why it
-is not shared. `STARTUP_DIAGNOSTIC_NAME` became `pub(crate)` so the four hard-coded literals in
-`crates/gascan/src/client.rs` name it through the constant.
+**One of the two adjacent constants stayed put; the other has since moved, and the reason it
+moved is worth keeping.** `STARTUP_DIAGNOSTIC_NAME` is still in `daemon.rs`, still carrying the
+comment saying why it is not shared, and it became `pub(crate)` so the four hard-coded literals
+in `crates/gascan/src/client.rs` name it through the constant.
+
+`INSTANCE_STAGING_PURPOSE` was left in `socket.rs` by item 9 on the argument that `gascand` was
+the only stager. That argument expired: on branch `fix/daemon-reader-retryable-verdict` the
+CLI's retirement became a second stager, so `INSTANCE_STAGING_PURPOSE` moved into
+`gascan_core::daemon_protocol` beside a new `RECLAIM_STAGING_PURPOSE`, both are pinned in
+`crates/gascan-core/tests/daemon_protocol.rs` — including an `assert_ne!` that they differ, so a
+stray file says which process left it — and `sweep_abandoned_staging` sweeps both prefixes. **The
+lesson generalises: "only one caller needs it" is a fact about today, not a reason not to
+share.**
 
 **THE RESULT WORTH CARRYING FORWARD IS THAT THE ACCEPTANCE BAR IN THE OLD BRIEF WAS NOT
 REACHABLE AS WRITTEN, AND MEASURING IT SHOWED WHY.** The brief said a value change in
@@ -286,17 +304,19 @@ nor any ssh path is in it; and the test passes alone, 2/2. **The stronger anchor
 `git diff c44720a 025b922` is empty** — merged `main`'s tree is byte-identical to the branch
 head, which ran **1499 passed, 0 failed, 49 ignored** with fmt 0, clippy 0, 49 ignored matching
 baseline and 15 contracts at status 0. Verify every SHA here with `git log -1` and
-`git ls-remote`; do not trust one written in this file. Open item 1 below now records what is
-left rather than what to do, and **what is left is real** — see its residual section.
+`git ls-remote`; do not trust one written in this file. Open item 1 below records what that
+merge left behind and what the branch after it did about it.
 
-**Item 9 is merged. Item 1's residual is the assignment — see THE ONE THING TO DO NEXT above.
-Everything else in this list is carried state, not an assignment.** Item 2c was decided on
-2026-08-18 and is now an unstarted implementation rather than an open question.
+**Item 9 is merged. Item 1's residual is implemented on an unmerged branch — see
+THE ONE THING TO DO NEXT above and open item 1 below. Everything else in this list is carried
+state, not an assignment.** Item 2c was decided on 2026-08-18 and **remains decided but
+unbuilt**: an unstarted implementation with a specified shape, not an open question.
 
 ### WHAT IS OPEN
 
-1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). WHAT REMAINS IS
-   THE READER'S HALF, AND IT IS NOT FIXED.**
+1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). THE READER'S HALF
+   — THIS ITEM'S RESIDUAL — IS FIXED ON AN UNMERGED BRANCH, `fix/daemon-reader-retryable-verdict`.
+   ONE NARROW FOLLOW-UP IS KNOWINGLY LEFT; IT IS THE LAST BLOCK OF THIS ITEM.**
 
    **What it was.** `write_instance_record` (`crates/gascand/src/socket.rs`) created the record
    at its final path inert — 0200, empty — wrote the content, `sync_all`-ed, then chmod-ed to
@@ -313,44 +333,97 @@ Everything else in this list is carried state, not an assignment.** Item 2c was 
    same file already did for the socket. The bounded 64-cycle form of that probe is committed as
    `no_reader_ever_sees_an_illegal_state_across_start_and_stop`.
 
-   **THE HEADLINE CORRECTION, AND DO NOT LOSE IT: THE PATH IS NOT DOWN TO THREE FACES.** A first
-   draft of the `validate_file_stat` comment claimed it was, and two independent reviewers caught
-   it. `gascan`'s own reclaim, `retire_held_record` (`crates/gascan/src/daemon.rs:1453-1455`),
-   still does `fchmod(0200)` then `ftruncate(0)` on a **published** record that
-   `validate_held_published_record` has just proven is still linked at the destination. So the
-   destination still goes 0600-with-content → **0200-with-content** → 0200-empty on the
-   `recover_stale_published_record` path — the ordinary "previous daemon was SIGKILLed, next
-   `gascan start` cleans up" path. And `inspect` (`daemon.rs:1966`) takes **no** lifecycle lock
-   while `start_with` (`:1171`) does, so a concurrent `gascan status` can still sample it.
+   **THE HEADLINE CORRECTION IS NOW ITSELF CORRECTED: THE PATH *IS* DOWN TO THREE FACES.** An
+   earlier draft of this entry said "THE PATH IS NOT DOWN TO THREE FACES", and it was true when
+   written. `gascan`'s own reclaim, `retire_held_record`, did `fchmod(0200)` then `ftruncate(0)`
+   on a **published** record that `validate_held_published_record` had just proven was still
+   linked at the destination, so the destination went 0600-with-content → **0200-with-content**
+   → 0200-empty on the ordinary "previous daemon was SIGKILLed, next `gascan start` cleans up"
+   path — and `inspect` takes **no** lifecycle lock while `start_with` does, so a concurrent
+   `gascan status` could sample it. The design change that paragraph said was needed is the
+   change that was made.
 
-   It is two syscalls wide rather than an `fsync`, and the record there has been proven dead
-   twice over, so the verdict it produces is unflattering rather than false. **That is why it was
-   not folded into the same change**: `validate_retired_tombstone` (`:1548`) requires the held
-   descriptor's inode to still be *at the name* and requires `st_nlink == 1`, and a rename
-   unlinks it — so staging-and-renaming there means rewriting that validation against the new
-   tombstone rather than the old descriptor. That is a design change to the reclaim protocol, not
-   a mechanical one.
+   **BOTH HALVES ARE FIXED ON BRANCH `fix/daemon-reader-retryable-verdict`, WHICH IS NOT MERGED.**
+   Base `3cf98b5`. Re-derive the commit range with
+   `git log --oneline main..fix/daemon-reader-retryable-verdict` rather than trusting a SHA
+   written here; the SHAs in this file have gone stale on their own repeatedly.
 
-   **Also true, and also not fixed: the reader has no retryable verdict.** Every disagreement
-   between two of its observations is terminal. `validate_instance_tombstone`
-   (`daemon.rs:2842-2880`) re-opens the tombstone by name and returns a terminal
-   `PermissionDenied` if a successor published in between; `open_published_record` (`:2611`)
-   reports a legitimate concurrent *stop* as `Unsafe`. Both are pre-existing and both are now
-   narrower — a rename rather than an fsync — but the shape is unchanged: **every narrow window
-   is a terminal verdict waiting for a loaded machine.**
+   **The producer half.** Retirement stages an inert file under a `.reclaim-` name, renames it
+   over the destination, and destroys the retired record's bytes only *after* the rename has
+   taken that inode out of the namespace. `validate_retired_tombstone` was rewritten against two
+   identities — the name resolves to the freshly staged inode wearing the inert face, and the
+   held inode has `st_size == 0` with `st_nlink == 0` — instead of requiring the held descriptor
+   to still be at the name. That trade lost one thing and it was restored deliberately: the old
+   post-condition proved the inode at the name was the one the recovery had validated, and the
+   replacement cannot, so `retire_held_record` compares the destination against
+   `record.identity` immediately *before* the non-`NOREPLACE` `renameat` and refuses with
+   `TombstoneChanged` if the name stopped naming its record. The two staging prefixes are now
+   shared protocol in `gascan_core::daemon_protocol` and the sweeper covers both.
+
+   **The reader half.** Race-shaped failures carry a marker (`raced` / `is_raced`) and the whole
+   observation sequence — `observe_once` — is retried up to three times rather than any single
+   validator, because retrying one observation against stale others manufactures fresh
+   disagreements. **Classification is terminal by default**: only a failure explicitly
+   constructed as raced retries, so a validator added later that nobody classifies stays
+   `Unsafe`. `(0200, content)` stays terminal on purpose — see the three-face rule in
+   `gascan_core::daemon_protocol`: the only producer left in production code is a `gascand` from
+   an older release, and nothing is going to come along and finish that record.
+
+   **The mutation results that matter, all MEASURED on 2026-08-19 at `beb05f4`, each one run by
+   hand and reverted:**
+
+   - Restoring the old two syscalls in `retire_held_record` (`fchmod` to `INSTANCE_TOMBSTONE_MODE`
+     then `ftruncate`, no staging, no rename) fails
+     `cargo test -p gascan --lib no_reader_ever_sees_an_illegal_state_across_reclaim` with
+     `a reader saw [Some((128, 341))]`. `128` is `0o200`. **`341` is that machine's number, not
+     the protocol's** — the record embeds `std::env::current_exe()`, so its serialised length
+     moves with the path of the test binary, and the same mutation run from a tree at a different
+     path reports a different second number. The test does not depend on it: it computes the legal
+     published size from `whole.len()` at run time.
+   - Hoisting the truncation above the `renameat` in `retire_held_record` fails the same test with
+     `a reader saw [Some((384, 0))]` — `0o600` at size zero, which `validate_file_stat` accepts as
+     a published record and a reader would then fail to parse. That is why the destructive step is
+     last.
+   - Widening the `ENOENT` split in `validate_instance_tombstone` to mark **every** errno raced
+     fails `a_symlink_swapped_over_the_tombstone_is_a_fault_not_a_race` with
+     `a symlink swapped over the tombstone is a fault, not a race: the daemon instance tombstone
+     was unlinked while validating it`. That test is the only thing holding the split narrow, and
+     narrowness is the whole of its safety: a symlink swapped over the name is the substitution
+     `O_NOFOLLOW` exists to refuse, and marking it raced hands the substituter a retry instead of
+     a verdict.
 
    **CI FOUND WHAT 47 MILLION LOCAL SAMPLES DID NOT — read trap 9.** The first pushed version of
-   this fix failed CI's `rust` job on `no_reader_ever_sees_an_illegal_state_across_start_and_stop`
-   with `Some((128, 9))`, and the cause was retirement chmod-ing the outgoing record before
-   truncating it: harmless in principle because the rename has already unlinked it, observable in
-   practice because `lstat` tears between resolving a name and reading the inode. Truncating
-   first fixed it, and a 4000-cycle probe then saw 0 of 87,277,118 samples.
+   the publisher fix failed CI's `rust` job on
+   `no_reader_ever_sees_an_illegal_state_across_start_and_stop` with `Some((128, 9))`, and the
+   cause was retirement chmod-ing the outgoing record before truncating it: harmless in principle
+   because the rename has already unlinked it, observable in practice because `lstat` tears
+   between resolving a name and reading the inode. Truncating first fixed it, and a 4000-cycle
+   probe then saw 0 of 87,277,118 samples.
 
-   **One window was introduced by the fix and is benign today:** `clear_inert_destination` unlinks
-   the tombstone, so `daemon.rs:2852` can now return `ENOENT` where it could not before.
-   `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)`, so `inspect_with` is
-   unaffected; only `read_attested_instance` (`:937`) propagates it, and that has no non-test
-   callers yet. **It will matter when Task 6 wires it.**
+   **The `ENOENT` that the publisher fix introduced is classified now, and it is NOT inert.**
+   `clear_inert_destination` unlinks the tombstone, so the `openat` in
+   `validate_instance_tombstone` can return `ENOENT` where it could not before. An earlier draft
+   of this entry — and the design spec — called that window reachable-but-inert in production on
+   the grounds that `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)`. **That
+   is backwards.** MEASURED on 2026-08-19 at `beb05f4` with a temporary probe, not in the tree,
+   calling `read_instance_record_for_inspection_with_hook` with a hook that unlinks the tombstone:
+   classification present → `Err(kind=PermissionDenied, raced=true)`; the `raced(...)` arm
+   reverted to `errno(error)` → `Ok(None)`. `raced()` builds a `PermissionDenied`, so the
+   `NotFound => Ok(None)` arm stops matching and stops swallowing it. The window therefore changes
+   from a silent "no record" — the reading that yields `Stopped` for a daemon that is coming up —
+   into a failure the retry looks at again. **No end-to-end verdict flip was tested, and none is
+   claimed.**
+
+   **KNOWINGLY LEFT, AND THE ONLY THING FROM THIS BRANCH STILL OPEN: the recheck `statat` in
+   `validate_instance_tombstone` carries an unmarked, terminal `ENOENT`.** Find it as the
+   `rustix::fs::statat(...).map_err(errno)?` after the `fstat` in that function — do not trust a
+   line number. Only the `openat` above it got the split. The exposed window is characterised
+   rather than guessed: `openat`→`fstat` is already covered, because an unlink there leaves
+   `st_nlink == 0`, `is_instance_tombstone` fails, and the existing raced mark fires. What is left
+   is `fstat`→recheck-`statat`, and within that only the sub-window between a successor's
+   `unlinkat` and its `renameat_with`. Narrow, real, and fail-closed today: the cost is an
+   unflattering `Unsafe` where a retry would have settled it, not a wrong action. It was left out
+   deliberately rather than missed, to keep the branch's scope where its evidence was.
 
 2. **(2c) THE DAEMON'S PRODUCTION LOG IS DECIDED AND UNBUILT. DO NOT RE-OPEN THE DECISION.**
    The maintainer ruled on 2026-08-18: **daemon-level events only, redacted.** Start, stop and

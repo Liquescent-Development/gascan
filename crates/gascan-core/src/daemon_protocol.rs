@@ -43,14 +43,28 @@
 //! building every next state under a staging name (see
 //! [`INSTANCE_STAGING_PURPOSE`]) and renaming it into place.
 //!
-//! **One in-tree producer still violates the rule and is not fixed.**
-//! `retire_held_record` in `crates/gascan/src/daemon.rs` `fchmod`s a
-//! *published* record to [`INSTANCE_TOMBSTONE_MODE`] and only then truncates
-//! it, in place at the destination, on the path where a previous daemon was
-//! `SIGKILL`ed and the next `gascan start` reclaims the record. Fixing it is a
-//! change to the reclaim protocol rather than a mechanical one, because
-//! `validate_retired_tombstone` requires the held descriptor's inode to still
-//! be at the name, and a rename unlinks it.
+//! **Every producer in this workspace's production code now obeys the rule.**
+//! `gascand` stages and renames, as above. So does the other producer, the
+//! CLI's `retire_held_record` in `crates/gascan/src/daemon.rs`, which used to
+//! `fchmod` a *published* record to [`INSTANCE_TOMBSTONE_MODE`] and only then
+//! truncate it, in place at the destination, on the path where a previous
+//! daemon was `SIGKILL`ed and the next `gascan start` reclaims the record. It
+//! now stages an inert file under a [`RECLAIM_STAGING_PURPOSE`] name, renames
+//! that over the destination, and destroys the retired record's bytes only
+//! afterwards -- by which point the rename has taken that inode out of the
+//! namespace, so the destructive step is invisible at the path.
+//!
+//! Test fixtures are the exception, deliberately: a reader that refuses the
+//! illegal face has to be shown it. `DelayedPublicationSpawner` and
+//! `commit_at_instance`, both in `crates/gascan/src/daemon.rs`, put
+//! `(INSTANCE_TOMBSTONE_MODE, content)` at the instance path on purpose.
+//!
+//! **The remaining way a reader meets it in the field is a `gascand` from a
+//! release older than the staged publication**, which is outside this tree and
+//! cannot be fixed by editing this tree. That is why the reader classifies
+//! `(INSTANCE_TOMBSTONE_MODE, non-empty)` as terminal rather than retrying it:
+//! nothing is going to come along and finish it, so a retry would poll a state
+//! that has already settled.
 //!
 //! # A stat is about the path only when `st_nlink == 1`
 //!
