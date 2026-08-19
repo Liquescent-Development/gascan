@@ -129,6 +129,7 @@ impl DaemonPaths {
             OsStr::new(LIFECYCLE_LOCK_NAME),
             &fd,
             self.expected_uid,
+            GuardedFile::LifecycleLock,
         )?;
         Ok(LifecycleLock { _fd: fd })
     }
@@ -164,6 +165,7 @@ impl DaemonPaths {
             OsStr::new(LIFECYCLE_LOCK_NAME),
             &fd,
             self.expected_uid,
+            GuardedFile::LifecycleLock,
         )?;
         Ok(LifecycleLock { _fd: fd })
     }
@@ -1042,295 +1044,360 @@ where
     E: DaemonEndpoint,
     P: ProcessInspector,
 {
-    inspect_with_hook(paths, expected_executable, endpoint, inspector, || Ok(())).await
-}
-
-/// The retry composed with the observation, with the observation's tombstone
-/// window exposed.
-///
-/// The composition is the whole feature: `retry_while_raced` and the `raced()`
-/// marks are each provable on their own, and neither reaches a user unless this
-/// line stands. A test drives a race through here so that collapsing it back to
-/// a single observation fails something. `Fn` rather than `FnOnce` because the
-/// retry rebuilds the observation on every attempt, which is what lets a hook
-/// fire on the first one and stand aside afterwards.
-async fn inspect_with_hook<E, P, F>(
-    paths: &DaemonPaths,
-    expected_executable: &Path,
-    endpoint: &E,
-    inspector: &P,
-    before_tombstone_validation: F,
-) -> Result<Inspection<E::Connection>, SupervisorError>
-where
-    E: DaemonEndpoint,
-    P: ProcessInspector,
-    F: Fn() -> io::Result<()>,
-{
-    const OBSERVATIONS: u32 = 3;
-
-    retry_while_raced(DEFAULT_POLL, OBSERVATIONS, || {
-        observe_once_with_hook(
-            paths,
-            expected_executable,
-            endpoint,
-            inspector,
-            &before_tombstone_validation,
-        )
-    })
+    observe::inspect_with_hook(
+        paths,
+        expected_executable,
+        endpoint,
+        inspector,
+        DEFAULT_POLL,
+        || Ok(()),
+    )
     .await
 }
 
-/// Looks again while the last look was raced, and fails closed when the looking
-/// runs out.
+/// The retry, the observation, and the line that composes them -- sealed so that
+/// the composition cannot be undone by accident.
 ///
-/// Generic over the observation so that the retry decision -- which verdict is
-/// returned, which is looked at again, how a path that never settles is
-/// reported -- is provable from canned observations. Driving it through the
-/// filesystem instead would mean racing a test thread against `delay`, and a
-/// verdict decided by a wall clock is not a verdict this suite can hold.
-async fn retry_while_raced<C, F, Fut>(
-    delay: Duration,
-    observations: u32,
-    mut observe: F,
-) -> Result<Inspection<C>, SupervisorError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<Inspection<C>, SupervisorError>>,
-{
-    let mut last_race: Option<String> = None;
-    for observation in 0..observations {
-        if observation > 0 {
-            tokio::time::sleep(delay).await;
-        }
-        let inspected = observe().await?;
-        match inspected.raced_detail() {
-            Some(detail) => last_race = Some(detail.to_owned()),
-            None => return Ok(inspected),
-        }
-    }
-    let detail = last_race.unwrap_or_else(|| "the daemon record kept changing".to_owned());
-    // The marker stays on the verdict this loop gives up with, and that is what
-    // makes "never settled" legible to a caller with budget this loop does not
-    // have: `ensure_started_locked`'s readiness loop matches on it rather than
-    // on the message below, which carries a runtime observation count. It
-    // cannot make this verdict retryable here -- it is built after the loop and
-    // never passed to `observe`, and `inspect_with_hook` is the only caller, so
-    // no `retry_while_raced` ever reads it.
-    let status_detail =
-        format!("the daemon record was still changing after {observations} observations: {detail}");
-    Ok(Inspection {
-        status: DaemonStatus {
-            state: DaemonState::Unsafe,
-            identity: None,
-            legacy: false,
-            detail: Some(status_detail),
-        },
-        session: None,
-        record: None,
-        interrupted_tombstone: None,
-        published_record: None,
-        raced: Some(detail),
-    })
-}
+/// An independent review of PR #87 measured the gap this closes: collapsing
+/// `inspect_with_hook`'s body to a single `observe_once_with_hook`, or setting
+/// `OBSERVATIONS` to 1, each failed exactly one test -- but rewriting
+/// `inspect_with`'s one-line delegation to call `observe_once_with_hook`
+/// *directly* failed nothing at all. The retry is provable, the marks are
+/// provable, and a caller stepping around both was silently green.
+///
+/// Rust's module privacy is the tool for "these functions have exactly one
+/// legitimate entry point", and `inspect_with_hook` is it -- reached by
+/// `inspect_with` and by `ensure_started_locked_with_hook`'s readiness loop, and
+/// by nothing else. `observe` holds all three functions; only that entry point
+/// leaves it, so the bypass that used to be a silently green mutation is now a
+/// name that does not resolve. Preferred to threading a hook parameter outward
+/// because it costs both callers nothing.
+mod observe {
+    /// The only door out of this module in a production build.
+    pub(super) use sealed::inspect_with_hook;
+    /// The suite proves the retry and the observation separately, so it reaches
+    /// both. Production cannot name either: `sealed` is private to this module,
+    /// and this re-export is the only other path to them.
+    #[cfg(test)]
+    pub(super) use sealed::{observe_once_with_hook, retry_while_raced};
 
-/// One observation, with the record read's tombstone window exposed.
-///
-/// The hook is how a test reaches the join this file could otherwise not defend:
-/// a `raced()` failure is produced inside a validator, and the `Unsafe` verdict
-/// built from it has to carry the marker out. Every observation in production
-/// passes a no-op, so nothing here behaves differently for it -- the same shape
-/// `read_instance_record_with_hook` and `open_private_directory_with_create_hook`
-/// already use in this file.
-async fn observe_once_with_hook<E, P, F>(
-    paths: &DaemonPaths,
-    expected_executable: &Path,
-    endpoint: &E,
-    inspector: &P,
-    before_tombstone_validation: F,
-) -> Result<Inspection<E::Connection>, SupervisorError>
-where
-    E: DaemonEndpoint,
-    P: ProcessInspector,
-    F: FnOnce() -> io::Result<()>,
-{
-    let record = read_instance_record_for_inspection_with_hook(paths, before_tombstone_validation);
-    let interrupted_tombstone = if record.is_err() {
-        match open_interrupted_tombstone(paths) {
-            Ok(tombstone) => tombstone,
-            Err(error) => {
-                let _ = probe_authenticated(paths, endpoint).await?;
-                return Ok(Inspection {
-                    status: DaemonStatus {
-                        state: DaemonState::Unsafe,
-                        identity: None,
-                        legacy: false,
-                        detail: Some(error.to_string()),
+    mod sealed {
+        use super::super::*;
+
+        /// The retry composed with the observation, with the observation's tombstone
+        /// window exposed.
+        ///
+        /// `poll` is a parameter rather than `DEFAULT_POLL` read from inside because
+        /// this was the one delay in the supervisor a caller's
+        /// `SupervisorTimeouts::poll` could not reach: the readiness loop in
+        /// `ensure_started_locked_with_hook` sets its own poll and then waited the
+        /// constant here regardless. `inspect_with` has no timeouts to honour and
+        /// passes `DEFAULT_POLL`, which is the value `SupervisorTimeouts::default`
+        /// also carries, so nothing moves for callers that never set one.
+        ///
+        /// The composition is the whole feature: `retry_while_raced` and the `raced()`
+        /// marks are each provable on their own, and neither reaches a user unless this
+        /// line stands. A test drives a race through here so that collapsing it back to
+        /// a single observation fails something. `Fn` rather than `FnOnce` because the
+        /// retry rebuilds the observation on every attempt, which is what lets a hook
+        /// fire on the first one and stand aside afterwards.
+        pub(in crate::daemon) async fn inspect_with_hook<E, P, F>(
+            paths: &DaemonPaths,
+            expected_executable: &Path,
+            endpoint: &E,
+            inspector: &P,
+            poll: Duration,
+            before_tombstone_validation: F,
+        ) -> Result<Inspection<E::Connection>, SupervisorError>
+        where
+            E: DaemonEndpoint,
+            P: ProcessInspector,
+            F: Fn() -> io::Result<()>,
+        {
+            const OBSERVATIONS: u32 = 3;
+
+            retry_while_raced(poll, OBSERVATIONS, || {
+                observe_once_with_hook(
+                    paths,
+                    expected_executable,
+                    endpoint,
+                    inspector,
+                    &before_tombstone_validation,
+                )
+            })
+            .await
+        }
+
+        /// Looks again while the last look was raced, and fails closed when the looking
+        /// runs out.
+        ///
+        /// Generic over the observation so that the retry decision -- which verdict is
+        /// returned, which is looked at again, how a path that never settles is
+        /// reported -- is provable from canned observations. Driving it through the
+        /// filesystem instead would mean racing a test thread against `delay`, and a
+        /// verdict decided by a wall clock is not a verdict this suite can hold.
+        pub(in crate::daemon) async fn retry_while_raced<C, F, Fut>(
+            delay: Duration,
+            observations: u32,
+            mut observe: F,
+        ) -> Result<Inspection<C>, SupervisorError>
+        where
+            F: FnMut() -> Fut,
+            Fut: Future<Output = Result<Inspection<C>, SupervisorError>>,
+        {
+            let mut last_race: Option<String> = None;
+            for observation in 0..observations {
+                if observation > 0 {
+                    tokio::time::sleep(delay).await;
+                }
+                let inspected = observe().await?;
+                match inspected.raced_detail() {
+                    Some(detail) => last_race = Some(detail.to_owned()),
+                    None => return Ok(inspected),
+                }
+            }
+            let detail = last_race.unwrap_or_else(|| "the daemon record kept changing".to_owned());
+            // The marker stays on the verdict this loop gives up with, and that is what
+            // makes "never settled" legible to a caller with budget this loop does not
+            // have: `ensure_started_locked`'s readiness loop matches on it rather than
+            // on the message below, which carries a runtime observation count. It
+            // cannot make this verdict retryable here -- it is built after the loop and
+            // never passed to `observe`, and `inspect_with_hook` is the only caller, so
+            // no `retry_while_raced` ever reads it.
+            let status_detail = format!(
+                "the daemon record was still changing after {observations} observations: {detail}"
+            );
+            Ok(Inspection {
+                status: DaemonStatus {
+                    state: DaemonState::Unsafe,
+                    identity: None,
+                    legacy: false,
+                    detail: Some(status_detail),
+                },
+                session: None,
+                record: None,
+                interrupted_tombstone: None,
+                published_record: None,
+                raced: Some(detail),
+            })
+        }
+
+        /// One observation, with the record read's tombstone window exposed.
+        ///
+        /// The hook is how a test reaches the join this file could otherwise not defend:
+        /// a `raced()` failure is produced inside a validator, and the `Unsafe` verdict
+        /// built from it has to carry the marker out. Every observation in production
+        /// passes a no-op, so nothing here behaves differently for it -- the same shape
+        /// `read_instance_record_with_hook` and `open_private_directory_with_create_hook`
+        /// already use in this file.
+        pub(in crate::daemon) async fn observe_once_with_hook<E, P, F>(
+            paths: &DaemonPaths,
+            expected_executable: &Path,
+            endpoint: &E,
+            inspector: &P,
+            before_tombstone_validation: F,
+        ) -> Result<Inspection<E::Connection>, SupervisorError>
+        where
+            E: DaemonEndpoint,
+            P: ProcessInspector,
+            F: FnOnce() -> io::Result<()>,
+        {
+            let record =
+                read_instance_record_for_inspection_with_hook(paths, before_tombstone_validation);
+            let interrupted_tombstone = if record.is_err() {
+                match open_interrupted_tombstone(paths) {
+                    Ok(tombstone) => tombstone,
+                    Err(error) => {
+                        let _ = probe_authenticated(paths, endpoint).await?;
+                        return Ok(Inspection {
+                            status: DaemonStatus {
+                                state: DaemonState::Unsafe,
+                                identity: None,
+                                legacy: false,
+                                detail: Some(error.to_string()),
+                            },
+                            session: None,
+                            record: None,
+                            interrupted_tombstone: None,
+                            published_record: None,
+                            raced: race_marker(&error),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            let published_record = match record.as_ref() {
+                Ok(Some(record)) => open_published_record(paths, record).map(Some),
+                Ok(None) | Err(_) => Ok(None),
+            };
+            let probe = probe_authenticated(paths, endpoint).await?;
+            if let Some(tombstone) = interrupted_tombstone {
+                return Ok(match probe {
+                    EndpointProbe::AbsentOrInert => Inspection {
+                        status: DaemonStatus {
+                            state: DaemonState::Unsafe,
+                            identity: None,
+                            legacy: false,
+                            detail: Some("daemon record publication was interrupted".to_owned()),
+                        },
+                        session: None,
+                        record: None,
+                        interrupted_tombstone: Some(tombstone),
+                        published_record: None,
+                        raced: None,
                     },
-                    session: None,
-                    record: None,
-                    interrupted_tombstone: None,
-                    published_record: None,
-                    raced: race_marker(&error),
+                    EndpointProbe::Unresponsive(detail) => Inspection {
+                        status: DaemonStatus {
+                            state: DaemonState::Unsafe,
+                            identity: None,
+                            legacy: false,
+                            detail: Some(format!(
+                                "daemon record publication was interrupted beside an unresponsive endpoint: {detail}"
+                            )),
+                        },
+                        session: None,
+                        record: None,
+                        interrupted_tombstone: None,
+                        published_record: None,
+                        raced: None,
+                    },
+                    EndpointProbe::Connected(session) => Inspection {
+                        status: DaemonStatus {
+                            state: DaemonState::Unsafe,
+                            identity: Some(session.identity.clone()),
+                            legacy: session.identity.release_version.is_none(),
+                            detail: Some(
+                                "a daemon endpoint is live beside interrupted publication state"
+                                    .to_owned(),
+                            ),
+                        },
+                        session: Some(session),
+                        record: None,
+                        interrupted_tombstone: Some(tombstone),
+                        published_record: None,
+                        raced: None,
+                    },
+                    EndpointProbe::Unsafe(detail) => Inspection {
+                        status: DaemonStatus {
+                            state: DaemonState::Unsafe,
+                            identity: None,
+                            legacy: false,
+                            detail: Some(detail),
+                        },
+                        session: None,
+                        record: None,
+                        interrupted_tombstone: None,
+                        published_record: None,
+                        raced: None,
+                    },
                 });
             }
-        }
-    } else {
-        None
-    };
-    let published_record = match record.as_ref() {
-        Ok(Some(record)) => open_published_record(paths, record).map(Some),
-        Ok(None) | Err(_) => Ok(None),
-    };
-    let probe = probe_authenticated(paths, endpoint).await?;
-    if let Some(tombstone) = interrupted_tombstone {
-        return Ok(match probe {
-            EndpointProbe::AbsentOrInert => Inspection {
-                status: DaemonStatus {
-                    state: DaemonState::Unsafe,
-                    identity: None,
-                    legacy: false,
-                    detail: Some("daemon record publication was interrupted".to_owned()),
-                },
-                session: None,
-                record: None,
-                interrupted_tombstone: Some(tombstone),
-                published_record: None,
-                raced: None,
-            },
-            EndpointProbe::Unresponsive(detail) => Inspection {
-                status: DaemonStatus {
-                    state: DaemonState::Unsafe,
-                    identity: None,
-                    legacy: false,
-                    detail: Some(format!(
-                        "daemon record publication was interrupted beside an unresponsive endpoint: {detail}"
-                    )),
-                },
-                session: None,
-                record: None,
-                interrupted_tombstone: None,
-                published_record: None,
-                raced: None,
-            },
-            EndpointProbe::Connected(session) => Inspection {
-                status: DaemonStatus {
-                    state: DaemonState::Unsafe,
-                    identity: Some(session.identity.clone()),
-                    legacy: session.identity.release_version.is_none(),
-                    detail: Some(
-                        "a daemon endpoint is live beside interrupted publication state".to_owned(),
-                    ),
-                },
-                session: Some(session),
-                record: None,
-                interrupted_tombstone: Some(tombstone),
-                published_record: None,
-                raced: None,
-            },
-            EndpointProbe::Unsafe(detail) => Inspection {
-                status: DaemonStatus {
-                    state: DaemonState::Unsafe,
-                    identity: None,
-                    legacy: false,
-                    detail: Some(detail),
-                },
-                session: None,
-                record: None,
-                interrupted_tombstone: None,
-                published_record: None,
-                raced: None,
-            },
-        });
-    }
-    let record = match record {
-        Ok(record) => record,
-        Err(error) => {
-            return Ok(Inspection {
-                status: DaemonStatus {
-                    state: DaemonState::Unsafe,
-                    identity: None,
-                    legacy: false,
-                    detail: Some(error.to_string()),
-                },
-                session: None,
-                record: None,
-                interrupted_tombstone: None,
-                published_record: None,
-                raced: race_marker(&error),
-            });
-        }
-    };
-    let published_record = match published_record {
-        Ok(published_record) => published_record,
-        Err(error) => {
-            return Ok(match probe {
-                EndpointProbe::AbsentOrInert | EndpointProbe::Unresponsive(_) => Inspection {
-                    status: DaemonStatus {
-                        state: DaemonState::Unsafe,
-                        identity: record.as_ref().map(DaemonIdentity::from),
-                        legacy: false,
-                        detail: Some(error.to_string()),
-                    },
-                    session: None,
-                    record,
-                    interrupted_tombstone: None,
-                    published_record: None,
-                    raced: race_marker(&error),
-                },
-                EndpointProbe::Connected(session) => Inspection {
-                    status: DaemonStatus {
-                        state: DaemonState::Unsafe,
-                        identity: Some(session.identity.clone()),
-                        legacy: session.identity.release_version.is_none(),
-                        detail: Some(error.to_string()),
-                    },
-                    session: Some(session),
-                    record,
-                    interrupted_tombstone: None,
-                    published_record: None,
-                    raced: race_marker(&error),
-                },
+            let record = match record {
+                Ok(record) => record,
+                Err(error) => {
+                    return Ok(Inspection {
+                        status: DaemonStatus {
+                            state: DaemonState::Unsafe,
+                            identity: None,
+                            legacy: false,
+                            detail: Some(error.to_string()),
+                        },
+                        session: None,
+                        record: None,
+                        interrupted_tombstone: None,
+                        published_record: None,
+                        raced: race_marker(&error),
+                    });
+                }
+            };
+            let published_record = match published_record {
+                Ok(published_record) => published_record,
+                Err(error) => {
+                    return Ok(match probe {
+                        EndpointProbe::AbsentOrInert | EndpointProbe::Unresponsive(_) => {
+                            Inspection {
+                                status: DaemonStatus {
+                                    state: DaemonState::Unsafe,
+                                    identity: record.as_ref().map(DaemonIdentity::from),
+                                    legacy: false,
+                                    detail: Some(error.to_string()),
+                                },
+                                session: None,
+                                record,
+                                interrupted_tombstone: None,
+                                published_record: None,
+                                raced: race_marker(&error),
+                            }
+                        }
+                        EndpointProbe::Connected(session) => Inspection {
+                            status: DaemonStatus {
+                                state: DaemonState::Unsafe,
+                                identity: Some(session.identity.clone()),
+                                legacy: session.identity.release_version.is_none(),
+                                detail: Some(error.to_string()),
+                            },
+                            session: Some(session),
+                            record,
+                            interrupted_tombstone: None,
+                            published_record: None,
+                            raced: race_marker(&error),
+                        },
+                        EndpointProbe::Unsafe(endpoint_fault) => {
+                            // Two failures, one verdict: the endpoint fault is
+                            // terminal and the record failure may be a race. The
+                            // status has always composed them; the marker must
+                            // compose them too, because `retry_while_raced` builds
+                            // its give-up verdict from the marker alone. Carrying
+                            // only the race half discards the actionable one on
+                            // exactly the path where looking again never settles.
+                            let composed = format!("{endpoint_fault}: {error}");
+                            Inspection {
+                                status: DaemonStatus {
+                                    state: DaemonState::Unsafe,
+                                    identity: record.as_ref().map(DaemonIdentity::from),
+                                    legacy: false,
+                                    detail: Some(composed.clone()),
+                                },
+                                session: None,
+                                record,
+                                interrupted_tombstone: None,
+                                published_record: None,
+                                raced: race_marker(&error).map(|_| composed),
+                            }
+                        }
+                    });
+                }
+            };
+
+            let mut inspection = match probe {
                 EndpointProbe::Unsafe(detail) => Inspection {
                     status: DaemonStatus {
                         state: DaemonState::Unsafe,
                         identity: record.as_ref().map(DaemonIdentity::from),
                         legacy: false,
-                        detail: Some(format!("{detail}: {error}")),
+                        detail: Some(detail),
                     },
                     session: None,
                     record,
                     interrupted_tombstone: None,
                     published_record: None,
-                    raced: race_marker(&error),
+                    raced: None,
                 },
-            });
+                EndpointProbe::AbsentOrInert => {
+                    classify_unreachable(paths, record, inspector).await?
+                }
+                EndpointProbe::Unresponsive(detail) => {
+                    classify_unresponsive(paths, record, inspector, detail).await?
+                }
+                EndpointProbe::Connected(session) => {
+                    classify_connected(expected_executable, record, session, inspector).await?
+                }
+            };
+            inspection.published_record = published_record;
+            Ok(inspection)
         }
-    };
-
-    let mut inspection = match probe {
-        EndpointProbe::Unsafe(detail) => Inspection {
-            status: DaemonStatus {
-                state: DaemonState::Unsafe,
-                identity: record.as_ref().map(DaemonIdentity::from),
-                legacy: false,
-                detail: Some(detail),
-            },
-            session: None,
-            record,
-            interrupted_tombstone: None,
-            published_record: None,
-            raced: None,
-        },
-        EndpointProbe::AbsentOrInert => classify_unreachable(paths, record, inspector).await?,
-        EndpointProbe::Unresponsive(detail) => {
-            classify_unresponsive(paths, record, inspector, detail).await?
-        }
-        EndpointProbe::Connected(session) => {
-            classify_connected(expected_executable, record, session, inspector).await?
-        }
-    };
-    inspection.published_record = published_record;
-    Ok(inspection)
+    }
 }
 
 pub(crate) async fn start_with<E, P, S>(
@@ -1482,11 +1549,12 @@ where
     loop {
         let inspected = match tokio::time::timeout_at(
             deadline,
-            inspect_with_hook(
+            observe::inspect_with_hook(
                 paths,
                 expected_executable,
                 endpoint,
                 inspector,
+                timeouts.poll,
                 &before_tombstone_validation,
             ),
         )
@@ -1699,7 +1767,10 @@ async fn prove_endpoint_absent_or_inert<E: DaemonEndpoint>(
 /// This mirrors `stage_inert_instance_file` in `crates/gascand/src/socket.rs`.
 /// The two are separate because they live in different crates and stage under
 /// different prefixes; the recipe they share -- create exclusive, `fchmod`,
-/// then verify rather than assume -- is the part that matters.
+/// then verify both the descriptor and the name rather than assume either -- is
+/// the part that matters. The name check was missing here while this comment
+/// already claimed it, which an independent review of PR #87 caught; it is the
+/// `raw_identity_at` comparison below.
 ///
 /// Nothing is ever written into this file. `sweep_abandoned_staging` in
 /// `crates/gascand/src/socket.rs` reasons from that: an abandoned `.reclaim-`
@@ -1729,10 +1800,27 @@ fn stage_inert_reclaim_file(
                 "reclaim staging file is not an inert private file",
             ));
         }
-        Ok(FileIdentity {
+        let identity = FileIdentity {
             device: stat.st_dev as u64,
             inode: stat.st_ino,
-        })
+        };
+        // The half of the mirrored recipe this function used to omit while its
+        // doc comment claimed it: `gascand`'s `stage_inert_instance_file`
+        // verifies the descriptor *and* that the staging name still resolves to
+        // the inode it opened, and only the first was done here. Without it a
+        // name substituted between the `openat` and this check would be the one
+        // renamed over the destination.
+        //
+        // `raw_identity_at` rather than `file_identity_at`: the question is which
+        // inode the name resolves to, and the legality of what is there has
+        // already been settled on the descriptor above.
+        if raw_identity_at(directory, staging.as_str())? != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reclaim staging file changed while opening it",
+            ));
+        }
+        Ok(identity)
     })();
     match staged {
         Ok(identity) => Ok((file, staging, identity)),
@@ -2006,7 +2094,12 @@ fn validate_held_published_record(
         device: stat.st_dev as u64,
         inode: stat.st_ino,
     };
-    if validate_file_stat(&stat, published_record.expected_uid).is_err()
+    if validate_file_stat(
+        &stat,
+        published_record.expected_uid,
+        GuardedFile::InstanceRecord,
+    )
+    .is_err()
         || identity != published_record.identity
         || stat.st_size as u64 != published_record.size
     {
@@ -2026,7 +2119,12 @@ fn validate_held_published_record(
         device: path.st_dev as u64,
         inode: path.st_ino,
     };
-    if validate_file_stat(&path, published_record.expected_uid).is_err()
+    if validate_file_stat(
+        &path,
+        published_record.expected_uid,
+        GuardedFile::InstanceRecord,
+    )
+    .is_err()
         || path_identity != published_record.identity
         || path.st_size as u64 != published_record.size
     {
@@ -3134,7 +3232,7 @@ fn require_identity_match(
 }
 
 fn read_instance_record(paths: &DaemonPaths) -> io::Result<Option<DaemonInstanceRecord>> {
-    read_instance_record_with_hook(paths, || Ok(()))
+    read_instance_record_with_hook(paths, || Ok(()), || Ok(()))
 }
 
 fn read_instance_record_for_inspection(
@@ -3152,6 +3250,7 @@ where
 {
     match read_instance_record_with_hook_and_directory_mode(
         paths,
+        || Ok(()),
         || Ok(()),
         before_tombstone_validation,
         false,
@@ -3174,7 +3273,13 @@ fn open_published_record(
         Mode::empty(),
     )
     .map_err(errno)?;
-    let identity = validate_open_file(&directory, name, &fd, paths.expected_uid)?;
+    let identity = validate_open_file(
+        &directory,
+        name,
+        &fd,
+        paths.expected_uid,
+        GuardedFile::InstanceRecord,
+    )?;
     let stat = rustix::fs::fstat(&fd).map_err(errno)?;
     let size = stat.st_size as u64;
     if size > MAX_INSTANCE_BYTES {
@@ -3192,7 +3297,7 @@ fn open_published_record(
     }
     let rechecked =
         rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
-    validate_file_stat(&rechecked, paths.expected_uid)?;
+    validate_file_stat(&rechecked, paths.expected_uid, GuardedFile::InstanceRecord)?;
     if (FileIdentity {
         device: rechecked.st_dev as u64,
         inode: rechecked.st_ino,
@@ -3278,8 +3383,7 @@ fn open_interrupted_tombstone(paths: &DaemonPaths) -> io::Result<Option<Interrup
         }) != identity
         || opened.st_size != initial.st_size
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(raced(
             "interrupted daemon instance descriptor changed while opening it",
         ));
     }
@@ -3292,8 +3396,7 @@ fn open_interrupted_tombstone(paths: &DaemonPaths) -> io::Result<Option<Interrup
         }) != identity
         || rechecked.st_size != initial.st_size
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+        return Err(raced(
             "interrupted daemon instance path changed while opening it",
         ));
     }
@@ -3315,16 +3418,19 @@ fn is_interrupted_tombstone(stat: &rustix::fs::Stat, expected_uid: u32) -> bool 
         && stat.st_size > 0
 }
 
-fn read_instance_record_with_hook<F>(
+fn read_instance_record_with_hook<F, H>(
     paths: &DaemonPaths,
     between_identity_and_open: F,
+    between_read_and_recheck: H,
 ) -> io::Result<Option<DaemonInstanceRecord>>
 where
     F: FnOnce() -> io::Result<()>,
+    H: FnOnce() -> io::Result<()>,
 {
     read_instance_record_with_hook_and_directory_mode(
         paths,
         between_identity_and_open,
+        between_read_and_recheck,
         || Ok(()),
         true,
     )
@@ -3337,14 +3443,16 @@ where
 /// different things to the caller that injects into them, and because firing the
 /// existing hook in the tombstone branch would silently move the injection point
 /// of every test that already uses it.
-fn read_instance_record_with_hook_and_directory_mode<F, G>(
+fn read_instance_record_with_hook_and_directory_mode<F, H, G>(
     paths: &DaemonPaths,
     between_identity_and_open: F,
+    between_read_and_recheck: H,
     before_tombstone_validation: G,
     create_directory: bool,
 ) -> io::Result<Option<DaemonInstanceRecord>>
 where
     F: FnOnce() -> io::Result<()>,
+    H: FnOnce() -> io::Result<()>,
     G: FnOnce() -> io::Result<()>,
 {
     let (parent, name) = instance_parent_and_name(paths.instance())?;
@@ -3364,7 +3472,12 @@ where
         validate_instance_tombstone(&directory, name, &initial_stat, paths.expected_uid)?;
         return Ok(None);
     }
-    let expected = file_identity_at(&directory, name, paths.expected_uid)?;
+    let expected = file_identity_at(
+        &directory,
+        name,
+        paths.expected_uid,
+        GuardedFile::InstanceRecord,
+    )?;
     between_identity_and_open()?;
     let fd = rustix::fs::openat(
         &directory,
@@ -3372,13 +3485,18 @@ where
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(errno)?;
-    let actual = validate_open_file(&directory, name, &fd, paths.expected_uid)?;
+    .map_err(|error| {
+        classify_unreadable_instance_record(error, &directory, name, paths.expected_uid)
+    })?;
+    let actual = validate_open_file(
+        &directory,
+        name,
+        &fd,
+        paths.expected_uid,
+        GuardedFile::InstanceRecord,
+    )?;
     if actual != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "daemon instance record changed while opening it",
-        ));
+        return Err(raced("daemon instance record changed while opening it"));
     }
     let mut bytes = Vec::new();
     File::from(fd)
@@ -3390,11 +3508,20 @@ where
             "daemon instance record is too large",
         ));
     }
-    if file_identity_at(&directory, name, paths.expected_uid)? != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "daemon instance record changed while reading it",
-        ));
+    // The window between the read and the recheck: a publisher can commit over
+    // the name here, and the recheck below is what notices. Production passes a
+    // no-op; a test passes the commit, because this window is not reachable from
+    // the hook above -- a substitution made there is caught by the earlier
+    // comparison instead, and never reaches this one.
+    between_read_and_recheck()?;
+    if file_identity_at(
+        &directory,
+        name,
+        paths.expected_uid,
+        GuardedFile::InstanceRecord,
+    )? != expected
+    {
+        return Err(raced("daemon instance record changed while reading it"));
     }
     let record: DaemonInstanceRecord = serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -3408,6 +3535,47 @@ fn is_instance_tombstone(stat: &rustix::fs::Stat, expected_uid: u32) -> bool {
         && stat.st_nlink == 1
         && Mode::from_raw_mode(stat.st_mode).bits() & 0o777 == INSTANCE_TOMBSTONE_MODE
         && stat.st_size == 0
+}
+
+/// The one tear in a stop transition that no validator can classify, because no
+/// validator runs: this read opens `O_RDONLY`, and a retirement's rename puts a
+/// 0200 file at the name, so a reader that resolved a published identity and
+/// reached the open one instant late is refused by the kernel before
+/// `validate_file_stat` ever sees a `Stat`.
+///
+/// Classified by evidence rather than by declaration, which is what separates it
+/// from the `GuardedFile` split. `EACCES` on its own does not say what changed,
+/// so the name is looked at again: if it now names an inert tombstone the
+/// retirement this reader was racing has committed, and if it has gone entirely
+/// then something removed the record between two of this reader's own looks.
+/// Both settle on another observation. Anything else keeps the kernel's terminal
+/// verdict -- so a record chmod-ed to 0200 and *left* there, which is the
+/// tampering shape, still reaches the caller as `Unsafe` rather than as three
+/// polite retries.
+///
+/// Only `EACCES` is split. Every other errno stays terminal, which is the
+/// direction that fails closed, and is the same narrowness
+/// `validate_instance_tombstone` holds for its own `ENOENT`.
+fn classify_unreadable_instance_record(
+    error: rustix::io::Errno,
+    directory: &OwnedFd,
+    name: &OsStr,
+    expected_uid: u32,
+) -> io::Error {
+    if error != rustix::io::Errno::ACCESS {
+        return errno(error);
+    }
+    match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if is_instance_tombstone(&stat, expected_uid) => raced(
+            "an inert daemon instance tombstone replaced the record between \
+             resolving its identity and opening it",
+        ),
+        Err(absent) if absent == rustix::io::Errno::NOENT => raced(
+            "the daemon instance record was unlinked between resolving its \
+             identity and opening it",
+        ),
+        _ => errno(error),
+    }
 }
 
 fn validate_instance_tombstone(
@@ -3448,8 +3616,24 @@ fn validate_instance_tombstone(
     {
         return Err(raced("daemon instance tombstone changed while opening it"));
     }
+    // The same narrow split the `openat` above carries, for the same reason and
+    // with the same limit: the name resolved when `initial_stat` was taken, so
+    // `ENOENT` here is a successor having unlinked the tombstone between two of
+    // this validator's own looks. Every other errno stays terminal -- `ELOOP` is
+    // a symlink swapped over the name, which is the substitution `O_NOFOLLOW`
+    // exists to refuse, and handing a substituter a retry instead of a verdict is
+    // the direction that fails open.
     let rechecked =
-        rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+        rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+            if error == rustix::io::Errno::NOENT {
+                raced(
+                    "the daemon instance tombstone was unlinked between validating \
+                     its descriptor and rechecking its name",
+                )
+            } else {
+                errno(error)
+            }
+        })?;
     if !is_instance_tombstone(&rechecked, expected_uid)
         || (FileIdentity {
             device: rechecked.st_dev as u64,
@@ -3758,6 +3942,7 @@ fn open_lock(directory: &OwnedFd, expected_uid: u32) -> io::Result<OwnedFd> {
             OsStr::new(LIFECYCLE_LOCK_NAME),
             &fd,
             expected_uid,
+            GuardedFile::LifecycleLock,
         )?;
         Ok(fd)
     })
@@ -3768,18 +3953,25 @@ fn validate_open_file(
     name: &OsStr,
     fd: &OwnedFd,
     expected_uid: u32,
+    guarded: GuardedFile,
 ) -> io::Result<FileIdentity> {
     let stat = rustix::fs::fstat(fd).map_err(errno)?;
-    validate_file_stat(&stat, expected_uid)?;
+    validate_file_stat(&stat, expected_uid, guarded)?;
     let identity = FileIdentity {
         device: stat.st_dev as u64,
         inode: stat.st_ino,
     };
-    if file_identity_at(directory, name, expected_uid)? != identity {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "protected runtime file changed while opening it",
-        ));
+    if file_identity_at(directory, name, expected_uid, guarded)? != identity {
+        // Same split as `validate_file_stat`'s, for the same reason: a name that
+        // stopped resolving to the descriptor just opened is a commit in flight
+        // for the instance record, whose publication and retirement both rename
+        // over it, and is foreign interference for the lifecycle lock, which
+        // nothing renames over.
+        let detail = "protected runtime file changed while opening it";
+        return Err(match guarded {
+            GuardedFile::InstanceRecord => raced(detail),
+            GuardedFile::LifecycleLock => io::Error::new(io::ErrorKind::PermissionDenied, detail),
+        });
     }
     Ok(identity)
 }
@@ -3788,9 +3980,30 @@ fn file_identity_at(
     directory: &OwnedFd,
     name: &OsStr,
     expected_uid: u32,
+    guarded: GuardedFile,
 ) -> io::Result<FileIdentity> {
-    let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
-    validate_file_stat(&stat, expected_uid)?;
+    // Every caller reaches this having already resolved `name` moments earlier --
+    // the record read from its own opening `statat`, `validate_open_file` from
+    // the descriptor it just opened through it. So `ENOENT` here is not "there is
+    // no daemon"; it is the name having stopped resolving between two of the
+    // reader's own looks, which for the instance record is a successor renaming
+    // or unlinking it. That distinction is load-bearing beyond the retry:
+    // unmarked, this error is `NotFound`, and
+    // `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)` -- so
+    // the window used to read out as a confident "stopped" for a daemon that was
+    // mid-transition. `raced()` builds a `PermissionDenied`, which that arm no
+    // longer swallows.
+    //
+    // Nothing renames or unlinks the lifecycle lock, so it keeps the terminal
+    // verdict, and every other errno stays terminal for both.
+    let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+        if error == rustix::io::Errno::NOENT && matches!(guarded, GuardedFile::InstanceRecord) {
+            raced("the daemon instance record's name stopped resolving while validating it")
+        } else {
+            errno(error)
+        }
+    })?;
+    validate_file_stat(&stat, expected_uid, guarded)?;
     Ok(FileIdentity {
         device: stat.st_dev as u64,
         inode: stat.st_ino,
@@ -3851,30 +4064,129 @@ fn file_identity_at(
 ///
 /// Size is therefore reported in every case, because it is the field that
 /// separates them and its absence made a CI failure unattributable.
-fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> io::Result<()> {
+fn validate_file_stat(
+    stat: &rustix::fs::Stat,
+    expected_uid: u32,
+    guarded: GuardedFile,
+) -> io::Result<()> {
     let mode = Mode::from_raw_mode(stat.st_mode).bits() & 0o777;
     let fault = if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        "not a regular file"
+        StatFault::NotRegularFile
     } else if stat.st_uid != expected_uid {
-        "owned by another user"
+        StatFault::ForeignOwner
+    } else if stat.st_nlink == 0 {
+        StatFault::Unlinked
     } else if stat.st_nlink != 1 {
-        "link count is not one"
+        StatFault::ExtraLinks
     } else if mode == INSTANCE_TOMBSTONE_MODE && stat.st_size == 0 {
-        "mode is 0200 and the file is empty: not yet published"
+        StatFault::InertTombstone
     } else if mode == INSTANCE_TOMBSTONE_MODE {
-        "mode is 0200 and the file has content: written but never published"
+        StatFault::UnpublishedRecord
     } else if mode != PRIVATE_FILE_MODE {
-        "mode is not 0600"
+        StatFault::WrongMode
     } else {
         return Ok(());
     };
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!(
-            "protected runtime file is unsafe: {fault} (mode {mode:04o}, size {}, links {}, uid {}, expected uid {expected_uid})",
-            stat.st_size, stat.st_nlink, stat.st_uid
-        ),
-    ))
+    let detail = format!(
+        "protected runtime file is unsafe: {} (mode {mode:04o}, size {}, links {}, uid {}, expected uid {expected_uid})",
+        fault.detail(),
+        stat.st_size,
+        stat.st_nlink,
+        stat.st_uid
+    );
+    Err(if fault.is_transitional_for(guarded) {
+        raced(&detail)
+    } else {
+        io::Error::new(io::ErrorKind::PermissionDenied, detail)
+    })
+}
+
+/// Which protected runtime file a validator is guarding, and therefore which of
+/// `validate_file_stat`'s faults are that file changing between its own legal
+/// faces rather than something being wrong with it.
+///
+/// It is a parameter rather than an inference because `validate_file_stat` sees
+/// only a `Stat`, and the two files it guards are indistinguishable from one:
+/// the same mode on the lifecycle lock and on the instance record mean opposite
+/// things. Making every call site say which file it is holding also means a call
+/// site added later cannot inherit a classification by accident -- it will not
+/// compile until it states one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GuardedFile {
+    /// The lifecycle lock, created 0600 by `open_lock` and never wearing another
+    /// face. Nothing renames anything over it, so every fault below is a fault.
+    LifecycleLock,
+    /// The daemon instance record, whose legal faces are enumerated by the
+    /// three-face rule in `gascan_core::daemon_protocol`, and whose publication
+    /// and retirement both commit by renaming a staged file over the name.
+    InstanceRecord,
+}
+
+/// The distinct faults `validate_file_stat` can find.
+///
+/// Named as values rather than left as message strings inside the condition
+/// chain so that the decision "fault, or transition caught in flight" is made
+/// once, in [`StatFault::is_transitional_for`], against the file being guarded.
+/// A fail-closed classification widened accidentally is the failure mode this
+/// shape exists to prevent, and a condition chain that both detects and
+/// classifies is where that happens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatFault {
+    NotRegularFile,
+    ForeignOwner,
+    /// No name resolves to this inode any more. Distinct from [`Self::ExtraLinks`]
+    /// because the two are opposite signals: this one is someone having replaced
+    /// the name, and that one is someone having added one.
+    Unlinked,
+    ExtraLinks,
+    InertTombstone,
+    UnpublishedRecord,
+    WrongMode,
+}
+
+impl StatFault {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::NotRegularFile => "not a regular file",
+            Self::ForeignOwner => "owned by another user",
+            Self::Unlinked => "link count is zero: unlinked while it was held",
+            Self::ExtraLinks => "link count is not one",
+            Self::InertTombstone => "mode is 0200 and the file is empty: not yet published",
+            Self::UnpublishedRecord => {
+                "mode is 0200 and the file has content: written but never published"
+            }
+            Self::WrongMode => "mode is not 0600",
+        }
+    }
+
+    /// The whole of the widening, in one place.
+    ///
+    /// Only the instance record has legal faces other than 0600-with-content,
+    /// and only two of these faults are it moving between them:
+    ///
+    /// - [`Self::Unlinked`] is the inode a reader still holds after a publication
+    ///   or a retirement renamed its replacement over the name. MEASURED at
+    ///   `bf107a1` to be the *most common* way a `gascan status` tears across an
+    ///   ordinary stop -- see
+    ///   `every_reader_failure_across_a_real_stop_transition_is_marked_raced`.
+    ///   [`Self::ExtraLinks`] is deliberately not included: a second name for
+    ///   this file is someone else's doing, not the daemon's.
+    /// - [`Self::InertTombstone`] is the retirement's committed result appearing
+    ///   under a reader that had already decided it was reading a published
+    ///   record.
+    ///
+    /// [`Self::UnpublishedRecord`] -- 0200 *with content* -- stays terminal, and
+    /// that is the line this function exists to hold. Per the three-face rule in
+    /// `gascan_core::daemon_protocol` the only producer of it left in production
+    /// is a `gascand` from an older release, so nothing is going to come along
+    /// and finish that record: retrying it would report a stuck record as a
+    /// passing squall. Ownership, file type and mode faults stay terminal
+    /// everywhere for the same reason -- they are tampering signals, and a retry
+    /// hands a tamperer another attempt instead of a verdict.
+    fn is_transitional_for(self, guarded: GuardedFile) -> bool {
+        matches!(guarded, GuardedFile::InstanceRecord)
+            && matches!(self, Self::Unlinked | Self::InertTombstone)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4136,6 +4448,7 @@ fn errno(error: rustix::io::Errno) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::observe::{inspect_with_hook, observe_once_with_hook, retry_while_raced};
     use super::{
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
         DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
@@ -4145,10 +4458,10 @@ mod tests {
         ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
         SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
         connect_current_or_recover_with, connect_current_or_recover_with_observer,
-        ensure_started_locked_with_hook, inspect_with, inspect_with_hook, is_raced,
-        observe_once_with_hook, open_interrupted_tombstone, open_published_record, race_marker,
-        raced, read_attested_instance, read_instance_record_with_hook, restart_with,
-        retire_held_record, retire_held_record_with_hook, retry_while_raced, signal_attested_with,
+        ensure_started_locked_with_hook, inspect_with, is_raced, open_interrupted_tombstone,
+        open_published_record, race_marker, raced, read_attested_instance,
+        read_instance_record_for_inspection, read_instance_record_with_hook, restart_with,
+        retire_held_record, retire_held_record_with_hook, signal_attested_with,
         signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
@@ -6671,6 +6984,445 @@ mod tests {
         Ok(())
     }
 
+    /// The reader's half of the transition the test above proves the producer
+    /// never breaks. That one asserts the *path* only ever shows a legal face;
+    /// this one asserts the *reader* never turns a legal transition into a
+    /// terminal verdict.
+    ///
+    /// A publish-and-retire loop runs against a reader spinning on
+    /// `read_instance_record_for_inspection`. Every failure it produces has to
+    /// carry the `raced()` marker, because every one of them is this transition
+    /// caught in flight -- and an unmarked failure is what `observe_once_with_hook`
+    /// turns into a terminal `DaemonState::Unsafe` for a daemon that is merely
+    /// stopping.
+    ///
+    /// MEASURED on 2026-08-19 at `bf107a1`, with a temporary probe not retained
+    /// in the tree and before any classification was added: over five seconds
+    /// this loop drove the reader to produce 2426 `link count is not one (mode
+    /// 0600, links 0)`, 1138 `mode is 0200 and the file is empty`, and 11 bare
+    /// `EACCES`, all three unmarked, beside 2662 and 438 already-marked
+    /// tombstone substitutions. Those three unmarked faults are what this test
+    /// holds closed. None of the reader's three identity-comparison failures
+    /// appeared in that sample: `validate_file_stat` reaches a verdict first on
+    /// every path this transition takes.
+    ///
+    /// The coverage assertion is what stops it passing vacuously. A reader that
+    /// never sampled a published record and never sampled a stopped path did not
+    /// cross the transition at all, and would satisfy the first assertion by
+    /// doing nothing.
+    #[test]
+    fn every_reader_failure_across_a_real_stop_transition_is_marked_raced() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let runtime = root(&temp)?.join("runtime");
+        let paths = DaemonPaths::from_runtime_root(runtime.clone());
+        paths.prepare_directory()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let whole = serde_json::to_vec(&record(&executable))?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = Arc::clone(&stop);
+            let paths = DaemonPaths::from_runtime_root(runtime.clone());
+            std::thread::spawn(move || {
+                let mut unmarked = std::collections::BTreeSet::new();
+                let mut published = 0_usize;
+                let mut stopped = 0_usize;
+                while !stop.load(Ordering::Acquire) {
+                    // Yield rather than spin, for the reason the reclaim probe
+                    // above yields: a saturated core is load, and this
+                    // workspace's suite is recorded wandering under it.
+                    std::thread::yield_now();
+                    match read_instance_record_for_inspection(&paths) {
+                        Ok(Some(_)) => published += 1,
+                        Ok(None) => stopped += 1,
+                        Err(error) if is_raced(&error) => {}
+                        Err(error) => {
+                            unmarked.insert(error.to_string());
+                        }
+                    }
+                }
+                (unmarked, published, stopped)
+            })
+        };
+
+        for _ in 0..4096 {
+            commit_at_instance(&paths, &whole, u32::from(PRIVATE_FILE_MODE))?;
+            std::thread::yield_now();
+            commit_at_instance(&paths, b"", u32::from(INSTANCE_TOMBSTONE_MODE))?;
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Release);
+        let (unmarked, published, stopped) = reader.join().map_err(|_| "the reader panicked")?;
+
+        assert!(
+            unmarked.is_empty(),
+            "a reader crossing a legitimate stop transition produced terminal failures, \
+             each of which is an `Unsafe` verdict for a daemon that is merely stopping: {unmarked:?}",
+        );
+        assert!(
+            published > 0 && stopped > 0,
+            "the reader never crossed the transition, so it proved nothing: it saw \
+             {published} published records and {stopped} stopped paths",
+        );
+        Ok(())
+    }
+
+    /// The one tear in an ordinary stop that no validator can classify, because
+    /// no validator runs: the record read opens `O_RDONLY`, and a retirement's
+    /// rename puts a 0200 file at the name, so a reader that resolved a published
+    /// identity and then reached the open one instant late is refused by the
+    /// kernel with `EACCES`. `validate_file_stat` never sees that stat.
+    ///
+    /// Rare and real. MEASURED at `bf107a1` with a temporary probe: 11 sightings
+    /// beside 3564 validator faults over five seconds of the loop in
+    /// `every_reader_failure_across_a_real_stop_transition_is_marked_raced`. At
+    /// eleven in five seconds that loop cannot be relied on to produce it at all,
+    /// let alone on a loaded CI runner, so the window is driven here
+    /// synchronously through the hook that sits inside it -- no second thread and
+    /// no clock decides the outcome.
+    #[test]
+    fn a_record_retired_between_resolving_its_identity_and_opening_it_is_raced() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        write_record(&paths, &record(&executable))?;
+
+        let instance = paths.instance().to_path_buf();
+        let outcome = read_instance_record_with_hook(
+            &paths,
+            || {
+                // Staged and renamed, so the replacement's inode is allocated
+                // while the original still holds one and the two cannot collide
+                // by reuse -- the same commit a retirement makes.
+                let staged = instance.with_extension("staged");
+                write_inert_tombstone(&staged, u32::from(INSTANCE_TOMBSTONE_MODE))?;
+                fs::rename(&staged, &instance)
+            },
+            || Ok(()),
+        );
+
+        let error = match outcome {
+            Ok(_) => return Err("a record retired under the reader must not read as safe".into()),
+            Err(error) => error,
+        };
+        assert!(
+            is_raced(&error),
+            "a retirement landing inside the reader's own window is a race, not a fault: {error}"
+        );
+        Ok(())
+    }
+
+    /// A publisher committing over a live record, which is the other direction
+    /// the instance path moves in and the one
+    /// `every_reader_failure_across_a_real_stop_transition_is_marked_raced`
+    /// structurally cannot reach: that loop always passes through a tombstone
+    /// between two publications, so its reader never sees published-A become
+    /// published-B inside one observation.
+    ///
+    /// MEASURED at 4096 cycles: reverting this classification to a terminal error
+    /// was caught by that loop 0 times in 3 runs. It is not a coverage gap in the
+    /// loop to be fixed by raising the count -- the transition is not one the loop
+    /// produces -- so the window is driven here through the hook that sits in it.
+    #[test]
+    fn a_record_republished_before_the_reader_opens_it_is_raced() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let published = record(&executable);
+        write_record(&paths, &published)?;
+        let bytes = serde_json::to_vec(&published)?;
+        let instance = paths.instance().to_path_buf();
+
+        let outcome =
+            read_instance_record_with_hook(&paths, || republish(&instance, &bytes), || Ok(()));
+
+        let error = match outcome {
+            Ok(_) => {
+                return Err("a republished record must not read as safe under the reader".into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            is_raced(&error),
+            "a publication committing inside the reader's window is a race, not a fault: {error}"
+        );
+        Ok(())
+    }
+
+    /// The same publication one step later, in the window between the reader
+    /// taking the bytes and rechecking the name.
+    ///
+    /// It has its own hook because it has to: a substitution made in the earlier
+    /// window is caught by the earlier comparison and never reaches this one, so
+    /// the two cannot share a seam. The loop catches this one 1 time in 3 at 4096
+    /// cycles -- real, but not a test.
+    #[test]
+    fn a_record_republished_before_the_reader_rechecks_it_is_raced() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let published = record(&executable);
+        write_record(&paths, &published)?;
+        let bytes = serde_json::to_vec(&published)?;
+        let instance = paths.instance().to_path_buf();
+
+        let outcome =
+            read_instance_record_with_hook(&paths, || Ok(()), || republish(&instance, &bytes));
+
+        let error = match outcome {
+            Ok(_) => {
+                return Err("a republished record must not read as safe under the reader".into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            is_raced(&error),
+            "a publication committing inside the reader's window is a race, not a fault: {error}"
+        );
+        Ok(())
+    }
+
+    /// A second publication of the same bytes, committed the way `gascand`
+    /// commits one: staged under a private name and renamed over the destination,
+    /// so the replacement is a legal published record wearing a *different*
+    /// inode. The contents match on purpose -- identity is what the reader
+    /// compares, and matching bytes prove it is comparing identity rather than
+    /// noticing a changed payload.
+    fn republish(instance: &Path, bytes: &[u8]) -> io::Result<()> {
+        let staged = instance.with_extension("republished");
+        fs::write(&staged, bytes)?;
+        fs::set_permissions(
+            &staged,
+            fs::Permissions::from_mode(u32::from(PRIVATE_FILE_MODE)),
+        )?;
+        fs::rename(&staged, instance)
+    }
+
+    /// The crash-recovery path's own race, which the stop-transition loop does
+    /// not reach: `open_interrupted_tombstone` is consulted only after a record
+    /// read has already failed, and only the illegal fourth face -- 0200 *with
+    /// content* -- makes it return anything.
+    ///
+    /// A reader gets there while a `gascan start` reclaim is retiring that
+    /// residue, which is the one producer allowed to change it. Both of this
+    /// function's identity comparisons are that reclaim committing between two of
+    /// the reader's looks, so both have to be retryable for the same reason the
+    /// record read's are.
+    ///
+    /// Driven by a real producer rather than a hook: this function takes no seam,
+    /// and adding two would cost more than the coverage is worth when the
+    /// transition is this easy to produce for real.
+    #[test]
+    fn every_interrupted_tombstone_failure_across_a_concurrent_reclaim_is_marked_raced()
+    -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let runtime = root(&temp)?.join("runtime");
+        let paths = DaemonPaths::from_runtime_root(runtime.clone());
+        paths.prepare_directory()?;
+        let residue = b"a record whose publication was interrupted";
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = Arc::clone(&stop);
+            let paths = DaemonPaths::from_runtime_root(runtime.clone());
+            std::thread::spawn(move || {
+                let mut unmarked = std::collections::BTreeSet::new();
+                let mut found = 0_usize;
+                let mut absent = 0_usize;
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                    match open_interrupted_tombstone(&paths) {
+                        Ok(Some(_)) => found += 1,
+                        Ok(None) => absent += 1,
+                        Err(error) if is_raced(&error) => {}
+                        Err(error) => {
+                            unmarked.insert(error.to_string());
+                        }
+                    }
+                }
+                (unmarked, found, absent)
+            })
+        };
+
+        for _ in 0..4096 {
+            commit_at_instance(&paths, residue, u32::from(INSTANCE_TOMBSTONE_MODE))?;
+            std::thread::yield_now();
+            commit_at_instance(&paths, b"", u32::from(INSTANCE_TOMBSTONE_MODE))?;
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Release);
+        let (unmarked, found, absent) = reader.join().map_err(|_| "the reader panicked")?;
+
+        assert!(
+            unmarked.is_empty(),
+            "a reader crossing a concurrent reclaim produced terminal failures: {unmarked:?}",
+        );
+        assert!(
+            found > 0 && absent > 0,
+            "the reader never crossed the transition, so it proved nothing: it saw \
+             {found} interrupted tombstones and {absent} absences",
+        );
+        Ok(())
+    }
+
+    /// `validate_open_file`'s own comparison, reached without racing anything.
+    ///
+    /// Two valid 0600 files in one directory, the descriptor on the first and the
+    /// name of the second: every field the validator checks passes on both, so the
+    /// identity comparison is the only thing that can fail. That is what makes
+    /// this a test of the classification rather than of the validation, and it is
+    /// why no producer thread is needed -- the disagreement is constructed, not
+    /// timed.
+    #[test]
+    fn a_descriptor_that_stopped_naming_the_instance_record_is_raced() -> TestResult {
+        let (_temp, directory, fd, uid) = mismatched_descriptor_and_name()?;
+
+        let error = match super::validate_open_file(
+            &directory,
+            std::ffi::OsStr::new("other"),
+            &fd,
+            uid,
+            super::GuardedFile::InstanceRecord,
+        ) {
+            Ok(_) => {
+                return Err("a descriptor that does not name its file must not validate".into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            is_raced(&error),
+            "the instance record's name resolving elsewhere is a commit in flight: {error}"
+        );
+        Ok(())
+    }
+
+    /// The lifecycle lock's half of the same comparison. Nothing renames anything
+    /// over the lock, so a name that stopped resolving to the held descriptor is
+    /// interference rather than a transition, and spending three observations
+    /// before saying so would be the wrong answer twice over.
+    #[test]
+    fn a_descriptor_that_stopped_naming_the_lifecycle_lock_is_terminal() -> TestResult {
+        let (_temp, directory, fd, uid) = mismatched_descriptor_and_name()?;
+
+        let error = match super::validate_open_file(
+            &directory,
+            std::ffi::OsStr::new("other"),
+            &fd,
+            uid,
+            super::GuardedFile::LifecycleLock,
+        ) {
+            Ok(_) => {
+                return Err("a descriptor that does not name its file must not validate".into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            !is_raced(&error),
+            "the lifecycle lock has no legitimate substituter, so this must stay terminal: {error}"
+        );
+        Ok(())
+    }
+
+    /// A directory descriptor, a descriptor on `held`, and the uid both files
+    /// carry. The caller passes the name `other`, which resolves to an equally
+    /// valid file with a different inode.
+    fn mismatched_descriptor_and_name() -> Result<
+        (
+            tempfile::TempDir,
+            std::os::fd::OwnedFd,
+            std::os::fd::OwnedFd,
+            u32,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let temp = tempfile::tempdir()?;
+        let dir = root(&temp)?;
+        for name in ["held", "other"] {
+            let path = dir.join(name);
+            fs::write(&path, b"a published record")?;
+            fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(u32::from(PRIVATE_FILE_MODE)),
+            )?;
+        }
+        let directory = rustix::fs::open(
+            &dir,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )?;
+        let fd = rustix::fs::open(
+            dir.join("held"),
+            rustix::fs::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )?;
+        Ok((temp, directory, fd, rustix::process::geteuid().as_raw()))
+    }
+
+    /// The window `validate_instance_tombstone` splits `ENOENT` for, driven
+    /// against a producer that actually unlinks.
+    ///
+    /// The stop-transition loop cannot reach it: that producer only ever renames,
+    /// so the name never stops resolving. A successor clearing an inert
+    /// destination before staging its own record does unlink, which is what makes
+    /// this validator's `ENOENT`s reachable.
+    ///
+    /// Read through `read_instance_record_with_hook` rather than through
+    /// `read_instance_record_for_inspection`, and that is not incidental: the
+    /// inspection wrapper maps `NotFound` to `Ok(None)`, so an *unmarked* `ENOENT`
+    /// from this validator is swallowed there and never reaches a caller as a
+    /// failure at all. MEASURED: with the reader on the inspection wrapper,
+    /// removing the `openat` `ENOENT` split entirely was caught 0 times in 3 runs,
+    /// because the mutation's own error is the one the wrapper discards. A test
+    /// above that mapping cannot see this class of regression.
+    #[test]
+    fn every_tombstone_failure_across_a_concurrent_unlink_is_marked_raced() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let runtime = root(&temp)?.join("runtime");
+        let paths = DaemonPaths::from_runtime_root(runtime.clone());
+        paths.prepare_directory()?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = Arc::clone(&stop);
+            let paths = DaemonPaths::from_runtime_root(runtime.clone());
+            std::thread::spawn(move || {
+                let mut unmarked = std::collections::BTreeSet::new();
+                let mut absent = 0_usize;
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                    match read_instance_record_with_hook(&paths, || Ok(()), || Ok(())) {
+                        Ok(_) => absent += 1,
+                        Err(error) if is_raced(&error) => {}
+                        Err(error) => {
+                            unmarked.insert(error.to_string());
+                        }
+                    }
+                }
+                (unmarked, absent)
+            })
+        };
+
+        let instance = paths.instance().to_path_buf();
+        for _ in 0..4096 {
+            commit_at_instance(&paths, b"", u32::from(INSTANCE_TOMBSTONE_MODE))?;
+            std::thread::yield_now();
+            fs::remove_file(&instance)?;
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Release);
+        let (unmarked, absent) = reader.join().map_err(|_| "the reader panicked")?;
+
+        assert!(
+            unmarked.is_empty(),
+            "a reader crossing a concurrent unlink produced terminal failures: {unmarked:?}",
+        );
+        assert!(
+            absent > 0,
+            "the reader never resolved the path at all, so it proved nothing",
+        );
+        Ok(())
+    }
+
     #[derive(Clone, Copy)]
     enum ShutdownFailure {
         Transport,
@@ -8172,6 +8924,7 @@ mod tests {
             super::validate_file_stat(
                 &stat,
                 rustix::process::geteuid().as_raw().saturating_add(1),
+                super::GuardedFile::InstanceRecord,
             )
             .is_err()
         );
@@ -8239,11 +8992,15 @@ mod tests {
         let expected = record(&executable);
         write_record(&paths, &expected)?;
         let replacement = serde_json::to_vec(&expected)?;
-        let result = read_instance_record_with_hook(&paths, || {
-            fs::remove_file(paths.instance())?;
-            fs::write(paths.instance(), &replacement)?;
-            fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))
-        });
+        let result = read_instance_record_with_hook(
+            &paths,
+            || {
+                fs::remove_file(paths.instance())?;
+                fs::write(paths.instance(), &replacement)?;
+                fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))
+            },
+            || Ok(()),
+        );
         assert!(result.is_err());
         Ok(())
     }
@@ -8518,7 +9275,7 @@ mod tests {
             let stat = rustix::fs::stat(&path)?;
             // Returns Result rather than expect-ing: this crate denies
             // clippy::expect_used in its own tests (lib.rs:2).
-            match super::validate_file_stat(&stat, uid) {
+            match super::validate_file_stat(&stat, uid, super::GuardedFile::InstanceRecord) {
                 Ok(()) => Err(io::Error::other(format!(
                     "mode {mode:04o} must not validate as safe"
                 ))),
@@ -8556,6 +9313,149 @@ mod tests {
             plainly_wrong.contains("mode is not 0600"),
             "a mode that is not a tombstone at all keeps the plain fault: {plainly_wrong}"
         );
+        Ok(())
+    }
+
+    /// Every face `validate_file_stat` separates, as files the kernel actually
+    /// produced.
+    ///
+    /// A hand-built `Stat` can spell states no filesystem ever produces, and the
+    /// two faces that decide this classification -- an inode with no name, and an
+    /// inert tombstone -- are precisely the ones worth producing for real. The
+    /// held descriptor comes back with them because the unlinked inode exists
+    /// only while something holds it open.
+    ///
+    /// The `transitional` column is written here independently of
+    /// `StatFault::is_transitional_for`, which is the point: it is the table the
+    /// production one has to agree with, not a reading of it.
+    #[expect(clippy::type_complexity, reason = "a fixture table, read once, below")]
+    fn every_stat_face(
+        temp: &tempfile::TempDir,
+    ) -> Result<
+        (Vec<(&'static str, rustix::fs::Stat, u32, bool)>, fs::File),
+        Box<dyn std::error::Error>,
+    > {
+        let dir = root(temp)?;
+        let uid = rustix::process::geteuid().as_raw();
+        let tombstone_mode = u32::from(INSTANCE_TOMBSTONE_MODE);
+        let published_mode = u32::from(PRIVATE_FILE_MODE);
+
+        let write = |name: &str, contents: &[u8], mode: u32| -> io::Result<PathBuf> {
+            let path = dir.join(name);
+            fs::write(&path, contents)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            Ok(path)
+        };
+
+        let inert = write("inert", b"", tombstone_mode)?;
+        let unpublished = write("unpublished", b"a record nobody published", tombstone_mode)?;
+        let linked = write("linked", b"a published record", published_mode)?;
+        fs::hard_link(&linked, dir.join("linked-again"))?;
+        let group_readable = write("group-readable", b"a published record", 0o640)?;
+        let directory = dir.join("a-directory");
+        fs::create_dir(&directory)?;
+
+        // The reader's own state after a rename lands under it: a descriptor on
+        // an inode that no name resolves to any more.
+        let doomed = write("doomed", b"a published record", published_mode)?;
+        let held = fs::File::open(&doomed)?;
+        fs::remove_file(&doomed)?;
+        let unlinked = rustix::fs::fstat(&held)?;
+
+        Ok((
+            vec![
+                ("an inert tombstone", rustix::fs::stat(&inert)?, uid, true),
+                ("an unlinked held inode", unlinked, uid, true),
+                (
+                    "a record written but never published",
+                    rustix::fs::stat(&unpublished)?,
+                    uid,
+                    false,
+                ),
+                ("a second hard link", rustix::fs::stat(&linked)?, uid, false),
+                (
+                    "a foreign owner",
+                    rustix::fs::stat(&inert)?,
+                    uid.saturating_add(1),
+                    false,
+                ),
+                (
+                    "a group-readable mode",
+                    rustix::fs::stat(&group_readable)?,
+                    uid,
+                    false,
+                ),
+                (
+                    "a directory at the name",
+                    rustix::fs::stat(&directory)?,
+                    uid,
+                    false,
+                ),
+            ],
+            held,
+        ))
+    }
+
+    /// The widening's blast radius, pinned to exactly two faults.
+    ///
+    /// The instance record's legal faces include the inert tombstone, and both
+    /// its publication and its retirement commit by renaming a staged file over
+    /// the name -- so an inode that lost its name, and a tombstone where a record
+    /// was, are that file moving rather than that file being wrong.
+    ///
+    /// Everything else stays terminal, and the load-bearing one is the record
+    /// written but never published. 0200 *with content* is the illegal fourth
+    /// face: nothing in production will come along and finish it, so a retry
+    /// would report a permanently stuck record as a passing squall.
+    #[test]
+    fn the_instance_record_treats_only_its_two_transitional_faces_as_races() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let (faces, _held) = every_stat_face(&temp)?;
+
+        for (face, stat, expected_uid, transitional) in faces {
+            let error = match super::validate_file_stat(
+                &stat,
+                expected_uid,
+                super::GuardedFile::InstanceRecord,
+            ) {
+                Ok(()) => return Err(format!("{face} must not validate as safe").into()),
+                Err(error) => error,
+            };
+            assert_eq!(
+                is_raced(&error),
+                transitional,
+                "{face} was classified wrongly for the instance record: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The other half of the same split, and the reason it is a parameter at all.
+    ///
+    /// `open_lock` creates the lifecycle lock 0600 and nothing renames anything
+    /// over it, so none of these faces is a transition for it -- including the two
+    /// that are transitions for the instance record. A lock file that turns up
+    /// unlinked or wearing 0200 is a fault, and marking it retryable would spend
+    /// three observations before saying so.
+    #[test]
+    fn the_lifecycle_lock_treats_every_fault_as_terminal() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let (faces, _held) = every_stat_face(&temp)?;
+
+        for (face, stat, expected_uid, _) in faces {
+            let error = match super::validate_file_stat(
+                &stat,
+                expected_uid,
+                super::GuardedFile::LifecycleLock,
+            ) {
+                Ok(()) => return Err(format!("{face} must not validate as safe").into()),
+                Err(error) => error,
+            };
+            assert!(
+                !is_raced(&error),
+                "{face} is a fault in the lifecycle lock and must stay terminal: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -8752,8 +9652,13 @@ mod tests {
     /// Time is paused, so the deadline and the polls are virtual and the loop
     /// ends where the test says it does rather than where the machine's load
     /// puts it. The readiness bound has to exceed one inspection, and one
-    /// inspection sleeps twice for `DEFAULT_POLL` inside `retry_while_raced`,
-    /// which `timeouts.poll` does not reach.
+    /// inspection sleeps twice inside `retry_while_raced`.
+    ///
+    /// ~~for `DEFAULT_POLL`, which `timeouts.poll` does not reach.~~ **Corrected:
+    /// it reaches it now.** `inspect_with_hook` takes the delay as a parameter and
+    /// this loop passes `timeouts.poll`, so the two sleeps below are the 10ms this
+    /// test sets rather than the 25ms constant. The bound is a second either way,
+    /// so nothing here had to move -- but the reason it holds did.
     #[tokio::test(start_paused = true)]
     async fn a_never_settled_inspection_is_polled_against_the_readiness_deadline() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -8813,6 +9718,156 @@ mod tests {
             observations.load(AtomicOrdering::SeqCst) > 3,
             "the loop gave up after a single inspection: {} observations",
             observations.load(AtomicOrdering::SeqCst)
+        );
+        Ok(())
+    }
+
+    /// The retry's delay is the caller's, and this is what proves it.
+    ///
+    /// An independent review of PR #87 recorded `DEFAULT_POLL` as the one delay in
+    /// the supervisor a caller's `SupervisorTimeouts::poll` could not reach:
+    /// `inspect_with_hook` read the constant from inside, so the readiness loop
+    /// set a poll and then waited 25ms regardless. MEASURED after the fix and
+    /// before this test existed: putting `DEFAULT_POLL` back in the readiness
+    /// loop's call passed all 320 tests. Nothing held it.
+    ///
+    /// The lever is arithmetic under a paused clock. Readiness has one second and
+    /// the poll is ten, so the deadline can only elapse *inside* the first
+    /// inspection's first sleep -- one observation, no more. Were the constant
+    /// still in force each sleep would be 25ms and that same second would buy
+    /// something on the order of forty inspections, which is what the sibling test
+    /// above sees at a 10ms poll. Three is one whole inspection, so the bound
+    /// below cannot be met by any reading in which the caller's poll was ignored.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_waits_the_caller_s_poll_rather_than_the_constant() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        paths.prepare_directory()?;
+        write_inert_tombstone(paths.instance(), u32::from(INSTANCE_TOMBSTONE_MODE))?;
+
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        let spawner = SilentSpawner::default();
+        let observations = AtomicUsize::new(0);
+        let instance = paths.instance().to_owned();
+
+        let result = ensure_started_locked_with_hook(
+            InspectionSubject {
+                paths: &paths,
+                expected_executable: &executable,
+                endpoint: &endpoint,
+                inspector: &inspector,
+            },
+            &spawner,
+            SupervisorTimeouts {
+                readiness: Duration::from_secs(1),
+                shutdown: Duration::from_millis(25),
+                poll: Duration::from_secs(10),
+            },
+            settled_observation(),
+            || {
+                let index = observations.fetch_add(1, AtomicOrdering::SeqCst);
+                let staged = instance.with_extension(format!("staged-{index}"));
+                write_inert_tombstone(&staged, u32::from(INSTANCE_TOMBSTONE_MODE))?;
+                fs::rename(&staged, &instance)
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(SupervisorError::Readiness {
+                    state: DaemonState::Unreachable,
+                    ..
+                })
+            ),
+            "a never-settled path must still end on the readiness deadline: {result:?}"
+        );
+        let spent = observations.load(AtomicOrdering::SeqCst);
+        assert!(
+            spent <= 3,
+            "a ten-second poll must exhaust a one-second readiness budget inside the \
+             first inspection; {spent} observations means the retry waited something \
+             shorter than the poll this caller set"
+        );
+        Ok(())
+    }
+
+    /// Two failures reach one verdict, and the give-up path must not drop the
+    /// terminal one.
+    ///
+    /// When the endpoint probe is `Unsafe` and the record read raced, the status
+    /// detail has always composed both halves -- but `retry_while_raced` builds
+    /// its give-up verdict out of the *marker*, and the marker used to carry only
+    /// the race. On a path that never settles, the half a human could act on was
+    /// the half discarded.
+    ///
+    /// The endpoint is pinned `Unsafe` and a producer supplies the race, so the
+    /// composed arm is reached for real rather than constructed. The final
+    /// assertion is the guard against a vacuous pass: an observation that never
+    /// composed proves nothing about composition.
+    #[tokio::test]
+    async fn a_terminal_endpoint_fault_survives_into_the_race_marker() -> TestResult {
+        const ENDPOINT_FAULT: &str = "the endpoint socket is owned by another user";
+
+        let temp = tempfile::tempdir()?;
+        let runtime = root(&temp)?.join("runtime");
+        let paths = DaemonPaths::from_runtime_root(runtime.clone());
+        paths.prepare_directory()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let whole = serde_json::to_vec(&record(&executable))?;
+        let endpoint = MutableEndpoint::new(EndpointProbe::Unsafe(ENDPOINT_FAULT.to_owned()));
+        let inspector = MutableInspector::new(None);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let stop = Arc::clone(&stop);
+            let paths = DaemonPaths::from_runtime_root(runtime.clone());
+            let whole = whole.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let published =
+                        commit_at_instance(&paths, &whole, u32::from(PRIVATE_FILE_MODE));
+                    std::thread::yield_now();
+                    let retired =
+                        commit_at_instance(&paths, b"", u32::from(INSTANCE_TOMBSTONE_MODE));
+                    std::thread::yield_now();
+                    if published.is_err() || retired.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+
+        let mut composed = 0_usize;
+        for _ in 0..4096 {
+            let inspected =
+                observe_once_with_hook(&paths, &executable, &endpoint, &inspector, || Ok(()))
+                    .await?;
+            let Some(detail) = inspected.status().detail.as_deref() else {
+                continue;
+            };
+            if !detail.contains(ENDPOINT_FAULT) {
+                continue;
+            }
+            if let Some(marker) = inspected.raced_detail() {
+                composed += 1;
+                assert!(
+                    marker.contains(ENDPOINT_FAULT),
+                    "the marker the give-up verdict is built from dropped the terminal \
+                     half: status {detail:?}, marker {marker:?}"
+                );
+            }
+        }
+        stop.store(true, Ordering::Release);
+        producer.join().map_err(|_| "the producer panicked")?;
+
+        assert!(
+            composed > 0,
+            "no observation composed a terminal endpoint fault with a race, so this \
+             proved nothing"
         );
         Ok(())
     }
@@ -9014,15 +10069,22 @@ mod tests {
 
         let instance = paths.instance().to_path_buf();
         let observations = std::cell::Cell::new(0u32);
-        let inspected = inspect_with_hook(&paths, &executable, &endpoint, &inspector, || {
-            observations.set(observations.get() + 1);
-            if observations.get() > 1 {
-                return Ok(());
-            }
-            let staged = instance.with_extension("staged");
-            write_inert_tombstone(&staged, tombstone_mode)?;
-            fs::rename(&staged, &instance)
-        })
+        let inspected = inspect_with_hook(
+            &paths,
+            &executable,
+            &endpoint,
+            &inspector,
+            Duration::ZERO,
+            || {
+                observations.set(observations.get() + 1);
+                if observations.get() > 1 {
+                    return Ok(());
+                }
+                let staged = instance.with_extension("staged");
+                write_inert_tombstone(&staged, tombstone_mode)?;
+                fs::rename(&staged, &instance)
+            },
+        )
         .await?;
 
         assert_eq!(
