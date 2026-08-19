@@ -754,6 +754,8 @@ and in `SupervisorTimeouts::default`, replace `poll: Duration::from_millis(25),`
 
 - [ ] **Step 4: Rename the existing body and add the wrapper**
 
+**Struck before implementation, 2026-08-19: the doc comment below says "Under `start_with` the lock makes a race impossible, so this never retries there." Do not write that sentence. `gascand` names the lifecycle lock path in `crates/gascand/src/socket.rs` and never takes it, so the lock fences the CLI's lifecycle callers against each other and not against a publishing daemon. The shipped comment on `inspect_with` says the opposite of this snapshot for that reason.**
+
 Rename the existing `pub(crate) async fn inspect_with` to `async fn observe_once`, keeping its body and signature otherwise identical. Then add:
 
 ```rust

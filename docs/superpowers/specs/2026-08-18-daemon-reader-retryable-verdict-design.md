@@ -206,10 +206,10 @@ record, and the endpoint probe. Retrying one against stale others manufactures f
 disagreements. The retry restarts the sequence from the top.
 
 Three observations total — which is **two retries**, and the observation count is the number to
-quote — with `SupervisorTimeouts::poll` between, matching the `for probe_index in 0..2` shape
-`recover_interrupted_tombstone` in `crates/gascan/src/daemon.rs` already uses. Under
-`start_with` the lifecycle lock makes a race impossible, so the retry is unreachable there and
-costs nothing.
+quote — with `DEFAULT_POLL` between, matching the `for probe_index in 0..2` shape
+`recover_interrupted_tombstone` in `crates/gascan/src/daemon.rs` already uses. `DEFAULT_POLL`
+rather than `SupervisorTimeouts::poll` because `inspect_with` takes no timeouts argument; the
+two are the same value except where a caller overrides `poll`.
 
 ### 4.3 What is transient
 

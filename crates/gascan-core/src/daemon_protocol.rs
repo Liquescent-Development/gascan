@@ -55,9 +55,10 @@
 //! namespace, so the destructive step is invisible at the path.
 //!
 //! Test fixtures are the exception, deliberately: a reader that refuses the
-//! illegal face has to be shown it. `DelayedPublicationSpawner` and
-//! `commit_at_instance`, both in `crates/gascan/src/daemon.rs`, put
-//! `(INSTANCE_TOMBSTONE_MODE, content)` at the instance path on purpose.
+//! illegal face has to be shown it. Several fixtures in
+//! `crates/gascan/src/daemon.rs` -- `DelayedPublicationSpawner` and
+//! `commit_at_instance` among them -- put `(INSTANCE_TOMBSTONE_MODE, content)`
+//! at the instance path on purpose.
 //!
 //! **The remaining way a reader meets it in the field is a `gascand` from a
 //! release older than the staged publication**, which is outside this tree and

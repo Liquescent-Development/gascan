@@ -167,7 +167,7 @@ EXECUTED.** The maintainer chose it on 2026-08-18 over fixing the CI flakes and 
 small gaps, because it was a wrong answer a user could actually see. It is implemented on branch
 `fix/daemon-reader-retryable-verdict` off base `3cf98b5`, in eight reviewed tasks (more commits
 than that — count them with `git log --oneline main..fix/daemon-reader-retryable-verdict`, do not
-trust a number written here), **and that branch is not merged.** The full record of what changed, what it measured, and the one thing it knowingly
+trust a number written here), **and that branch is not merged.** The full record of what changed, what it measured, and what it knowingly
 left is under `WHAT IS OPEN` item 1 — read that, not this summary.
 
 **The shape it had, kept because it is what the fix is answering:** `start_with` takes the
@@ -323,7 +323,8 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
 
 1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). THE READER'S HALF
    — THIS ITEM'S RESIDUAL — IS FIXED ON AN UNMERGED BRANCH, `fix/daemon-reader-retryable-verdict`.
-   ONE NARROW FOLLOW-UP IS KNOWINGLY LEFT; IT IS THE LAST BLOCK OF THIS ITEM.**
+   THAT HALF IS PARTIAL AND THE RESIDUE INCLUDES THE COMMON CASE; THE LAST BLOCKS OF THIS ITEM
+   SAY WHAT IS LEFT.**
 
    **What it was.** `write_instance_record` (`crates/gascand/src/socket.rs`) created the record
    at its final path inert — 0200, empty — wrote the content, `sync_all`-ed, then chmod-ed to
@@ -424,8 +425,42 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    into a failure the retry looks at again. **No end-to-end verdict flip was tested, and none is
    claimed.**
 
-   **KNOWINGLY LEFT, AND THE ONLY THING FROM THIS BRANCH STILL OPEN: the recheck `statat` in
-   `validate_instance_tombstone` carries an unmarked, terminal `ENOENT`.** Find it as the
+   **KNOWINGLY LEFT: THE RETRY COVERS FIVE RACE-SHAPED FAILURES AND THE REST ARE STILL TERMINAL,
+   INCLUDING THE COMMON CASE.** The five carrying `raced()` in `crates/gascan/src/daemon.rs` are
+   the three in `validate_instance_tombstone` and the two in `open_published_record` — find them
+   by the `raced(` constructor, not by line number.
+
+   **A `gascan status` that samples the path while a `gascand` renames its inert tombstone over a
+   published record — the published→inert transition, which is what a legitimate stop does — is
+   not among them in the common case.** A reader whose first `statat` lands after the rename sees
+   a plain tombstone and answers `Stopped`; the failures come from tearing across it, and those
+   tears reach `validate_file_stat`'s "mode is 0200 and the file is empty" fault (through
+   `file_identity_at`, either before the read or on the recheck after it) or the `EACCES` an
+   `O_RDONLY` `openat` returns against a 0200 file. Neither is marked, and
+   `open_interrupted_tombstone` answers `Ok(None)` on the way past because an inert tombstone is
+   not an interrupted one — so the verdict is built from the record read's unmarked failure and
+   is terminal. `open_published_record`'s own two marks are not reached on this path at all: they
+   sit *after* its `openat` and its `validate_open_file`, so they fire only when the replacement
+   is itself a legal published record — a publisher committing over a live record, rarer than a
+   stop. What this branch demonstrably changed is the tombstone-to-tombstone substitution and the
+   `clear_inert_destination` `ENOENT`.
+
+   **The rest of the residue, none of it marked:** the record read's "daemon instance record
+   changed while opening it" and "…changed while reading it"; `open_interrupted_tombstone`'s
+   "interrupted daemon instance descriptor changed while opening it" and "…path changed while
+   opening it"; and `validate_open_file`'s "protected runtime file changed while opening it".
+   Each fires when the name was substituted between two of the reader's own looks in a way the
+   stop transition above does not produce — that transition trips a `validate_file_stat` fault or
+   the `EACCES` first. Same characterisation as the recheck `statat` below — narrow, real and
+   fail-closed — and left for the same reason.
+
+   **Marking the rest is not a text change and must not be rushed.** `validate_file_stat`'s
+   "0200 and empty" is a genuine fault for the socket and the lifecycle lock, so it could only be
+   reclassified per call site, and widening a fail-closed classification at the end of a branch
+   is how that default gets weakened by accident.
+
+   **Inside `validate_instance_tombstone`, whose comparisons are marked, the recheck `statat`'s
+   own `ENOENT` is not.** Find it as the
    `rustix::fs::statat(...).map_err(errno)?` after the `fstat` in that function — do not trust a
    line number. Only the `openat` above it got the split. The exposed window is characterised
    rather than guessed: `openat`→`fstat` is already covered, because an unlink there leaves
@@ -434,6 +469,16 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    `unlinkat` and its `renameat_with`. Narrow, real, and fail-closed today: the cost is an
    unflattering `Unsafe` where a retry would have settled it, not a wrong action. It was left out
    deliberately rather than missed, to keep the branch's scope where its evidence was.
+
+   **ALSO LEFT: the wiring test pins the retry, not `inspect_with`'s own delegation.**
+   `a_raced_observation_is_looked_at_again_through_inspect_with` drives a real race through
+   `inspect_with_hook`, which is where `retry_while_raced` is composed with the observation.
+   MEASURED 2026-08-19 on this branch with `cargo test -p gascan --lib`: collapsing that
+   function's body to a single `observe_once_with_hook` gives **307 passed, 1 failed** — that one
+   test and nothing else — and `OBSERVATIONS = 1` gives the same. But rewriting `inspect_with`'s
+   one-line delegation to call `observe_once_with_hook` directly gives **308 passed, 0 failed**:
+   that mutation is not caught. It is the residual every `_with_hook` pair in this file carries.
+   The one failing test in each caught run is the new one, so the collapse is silent without it.
 
 2. **(2c) THE DAEMON'S PRODUCTION LOG IS DECIDED AND UNBUILT. DO NOT RE-OPEN THE DECISION.**
    The maintainer ruled on 2026-08-18: **daemon-level events only, redacted.** Start, stop and
