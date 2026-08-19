@@ -64,8 +64,17 @@ E0425, ``cannot find function `observe_once_with_hook` in module `observe` ``. N
 premise was off by one: `inspect_with_hook` has **two** legitimate callers, not one —
 `inspect_with` and `ensure_started_locked_with_hook`'s readiness loop.
 
-**All five review minors are now fixed**, not four; the fifth was the module seal above. Each of
-the other three is held by a test that fails when the fix is reverted — measured individually.
+**All five review minors are now fixed**, not four; the fifth was the module seal above. Three of
+the other four are held by a test that fails when the fix is reverted; `stage_inert_reclaim_file`'s
+staging-name check is not, and is listed with the uncovered branches below.
+
+**A second review round on `bf107a1..8613f22` found a Critical this file had already declared
+closed, and it was on the production path.** `open_published_record`'s `openat` was unclassified,
+so an ordinary stop still produced terminal `Unsafe` verdicts — MEASURED, 4456 of them in 20,000
+observations, 100% of the unmarked ones. The cause was that the completeness claim rested on a
+loop test reading one layer *below* what a production observation does. Fixed, along with four
+other findings, in the commit that follows `8613f22`. Read open item 1 for the full account; the
+methodological point is repeated there because it has now cost this branch twice.
 
 **VERIFIED at `ae03597`:** `cargo fmt --all --check` exit 0, `cargo clippy --workspace
 --all-targets -- -D warnings` clean, `cargo test --workspace` **1532 passed, 0 failed, 49
@@ -497,11 +506,32 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    reverted to `errno(error)` → `Ok(None)`. `raced()` builds a `PermissionDenied`, so the
    `NotFound => Ok(None)` arm stops matching and stops swallowing it. The window therefore changes
    from a silent "no record" — the reading that yields `Stopped` for a daemon that is coming up —
-   into a failure the retry looks at again. **No end-to-end verdict flip was tested, and none is
-   claimed.**
+   into a failure the retry looks at again. ~~No end-to-end verdict flip was tested, and none is
+   claimed.~~ **One is tested now:**
+   `every_unsafe_observation_across_a_real_stop_transition_is_marked_raced` drives whole
+   observations against a real producer and asserts every `Unsafe` carries a marker.
 
-   **THE READER HALF IS COMPLETE AS OF `ae03597`. THE BLOCKS THAT STOOD HERE — `KNOWINGLY
-   LEFT`, `ALSO LEFT` AND `FIVE MINORS` — ARE ALL DISCHARGED, AND WHAT REPLACES THEM IS SHORT.**
+   **THE READER HALF IS COMPLETE. THE BLOCKS THAT STOOD HERE — `KNOWINGLY LEFT`, `ALSO LEFT`
+   AND `FIVE MINORS` — ARE ALL DISCHARGED.**
+
+   ~~Complete as of `ae03597`.~~ **It was not, and the way it was wrong is the most useful thing
+   in this entry.** `ae03597` claimed completeness on the strength of a loop test that drove
+   `read_instance_record_for_inspection` — but a production observation does more than read the
+   record: a read that *succeeds* is followed by `open_published_record`, whose own `openat` was
+   unclassified. A review MEASURED it at `8613f22` by driving `observe_once_with_hook` instead,
+   20,000 observations against a publish-and-retire producer: **4456 terminal `Unsafe` verdicts,
+   100% of them from that one `openat`, about 55% of all `Unsafe` observations.** A `gascan
+   status` crossing an ordinary stop still reported a healthy daemon as unsafe, on the production
+   path, after a commit that said the case was covered.
+
+   **The lesson is not "one more site". It is that a test one layer below the production path
+   proves nothing about the production path** — the second time this exact mistake was made on
+   this branch (the first is recorded under
+   `every_tombstone_failure_across_a_concurrent_unlink_is_marked_raced`, where a reader placed
+   above `read_instance_record_for_inspection`'s `NotFound => Ok(None)` arm could not see the very
+   errors it was testing, and a whole classification could be deleted with the mutation caught
+   0/3). `every_unsafe_observation_across_a_real_stop_transition_is_marked_raced` now drives the
+   whole observation and is the test that should have been written first.
 
    **The design problem was real and the answer was a parameter, not a sweep.**
    `validate_file_stat` could not be reclassified in place because it guards two different files
@@ -548,14 +578,22 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    off by one: that function has **two** legitimate callers, `inspect_with` and
    `ensure_started_locked_with_hook`'s readiness loop.
 
-   **The other four minors are fixed, each held by a test that fails when the fix is reverted:**
-   `stage_inert_reclaim_file` now performs the staging-name check its doc comment already claimed
-   it shared with `gascand`'s mirror; `inspect_with_hook` takes the retry delay as a parameter so
-   `SupervisorTimeouts::poll` reaches it (MEASURED before the test existed: putting `DEFAULT_POLL`
-   back passed all 320 tests — nothing held it, and
-   `the_retry_waits_the_caller_s_poll_rather_than_the_constant` does now); and the give-up
-   verdict's marker composes the terminal endpoint fault with the race instead of dropping the
-   actionable half.
+   **The other four minors are fixed. Three are held by a test that fails when the fix is
+   reverted; the fourth is not, and an earlier draft of this entry claimed all four were —
+   corrected after a review MEASURED the difference.** `inspect_with_hook` takes the retry delay
+   as a parameter so `SupervisorTimeouts::poll` reaches it (MEASURED before the test existed:
+   putting `DEFAULT_POLL` back passed all 320 tests — nothing held it, and
+   `the_retry_waits_the_caller_s_poll_rather_than_the_constant` does now); the give-up verdict's
+   marker composes the terminal endpoint fault with the race instead of dropping the actionable
+   half; and the module seal is enforced by the compiler. **`stage_inert_reclaim_file`'s
+   staging-name check is the one with no test** — deleting the `raw_identity_at` comparison leaves
+   `cargo test -p gascan --lib` green, MEASURED — and it is listed as uncovered below, which is
+   where it belongs.
+
+   **The seal is a build property, not a test property.** The `#[cfg(test)]` re-export makes the
+   bypass nameable under the test harness, so `cargo test` alone stays green on it; CI catches it
+   because `cargo clippy --workspace --all-targets` compiles the lib target without `cfg(test)`.
+   Recorded in the `observe` module's own doc comment too.
 
    **WHAT IS STILL NOT COVERED BY A DRIVING TEST, and it is three defensive branches, all
    recorded rather than missed:** `stage_inert_reclaim_file`'s new staging-name comparison, plus
