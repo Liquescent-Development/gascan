@@ -15,8 +15,10 @@ instance record's publish race was fixed and merged (PR #80, #81). Everything ab
 flight.** Verify with `git log -1` and `git status`; do not trust a SHA in this file, which has
 gone stale on its own SHAs repeatedly.
 
-**No next item has been chosen. Do not pick one for yourself** — ask. Item 1's residual is the
-standing candidate and item 2c must not be decided alone; both are under `WHAT IS OPEN` below.
+**Your assignment is open item 1's residual: the reader's half of the daemon instance record.**
+The maintainer chose it on 2026-08-18. Its brief is under `THE ONE THING TO DO NEXT` below.
+Item 2c is no longer an open decision — it was decided the same day and is now an unstarted
+implementation with a specified shape.
 **You do not need the milestone-4 design, plan, or ledger** — that table is context for the
 milestone that closed, not a reading list. The one document you must read before touching
 anything about *offline* is `docs/evidence/2026-08-18-arca-engine-offline.md`.
@@ -153,9 +155,27 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### THE ONE THING TO DO NEXT
 
-**NOTHING IS ASSIGNED. ASK BEFORE STARTING ONE.** Item 9 was the assignment and it is done —
-its record is immediately below. Item 1's residual is the standing candidate for what follows
-and item 2c needs a decision rather than an implementation; both are under `WHAT IS OPEN`.
+**YOUR ASSIGNMENT IS OPEN ITEM 1'S RESIDUAL: THE READER HAS NO RETRYABLE VERDICT.** The
+maintainer chose it on 2026-08-18, over fixing the CI flakes and over the four small gaps,
+because it is a wrong answer a user can actually see. Item 9 is done and merged; its record is
+immediately below. The full statement of what is left is under `WHAT IS OPEN` item 1.
+
+**The user-visible shape of it, VERIFIED 2026-08-18 by reading the code rather than the
+tracker:** `start_with` takes the lifecycle lock (`crates/gascan/src/daemon.rs:1161`) and
+`inspect` does not (`:1969`), so a `gascan status` run concurrently with a legitimate stop can
+sample the record mid-transition. Every disagreement between two of the reader's observations
+is terminal — `validate_instance_tombstone` returns a terminal `PermissionDenied` if a
+successor published in between, and `open_published_record` reports a legitimate concurrent
+stop as `Unsafe`. None of them is retryable. The job is to teach the reader the difference
+between "I raced with a normal transition" and "something is actually wrong".
+
+**The known hard part, and it is why this was not folded into the publish-race fix:**
+`retire_held_record` (`crates/gascan/src/daemon.rs:1456-1460`, `fchmod(0200)` then
+`ftruncate(0)`, VERIFIED still in that order) cannot simply be staged-and-renamed like the
+publisher was, because `validate_retired_tombstone` requires the held descriptor's inode to
+still be *at the name* and a rename unlinks it. Changing that is a design change to the reclaim
+protocol. **Brainstorm the design before writing code, and do not weaken
+`validate_retired_tombstone` to make a rename fit.**
 
 ### ITEM 9 IS DONE AND MERGED.
 
@@ -269,10 +289,9 @@ baseline and 15 contracts at status 0. Verify every SHA here with `git log -1` a
 `git ls-remote`; do not trust one written in this file. Open item 1 below now records what is
 left rather than what to do, and **what is left is real** — see its residual section.
 
-**Item 9 is done and awaiting review; nothing else here has been assigned. Everything in this
-list is carried state, not an assignment.** Item 1's residual is the standing candidate for
-what follows. Item 2c needs a decision rather than an implementation and **must not be decided
-alone**.
+**Item 9 is merged. Item 1's residual is the assignment — see THE ONE THING TO DO NEXT above.
+Everything else in this list is carried state, not an assignment.** Item 2c was decided on
+2026-08-18 and is now an unstarted implementation rather than an open question.
 
 ### WHAT IS OPEN
 
@@ -333,11 +352,20 @@ alone**.
    unaffected; only `read_attested_instance` (`:937`) propagates it, and that has no non-test
    callers yet. **It will matter when Task 6 wires it.**
 
-2. **(2c) A PRODUCTION STDERR DESTINATION FOR THE DAEMON IS STILL DEFERRED**, as its own
-   decision with a privacy dimension — a daemon log holds sandbox names, project paths and
-   guest output. (2a) and (2b) have landed, which was the precondition. Raise it with the
-   maintainer with a concrete proposal for where the file lives, its mode, how it is bounded
-   and what is redacted. **Do not decide it alone.**
+2. **(2c) THE DAEMON'S PRODUCTION LOG IS DECIDED AND UNBUILT. DO NOT RE-OPEN THE DECISION.**
+   The maintainer ruled on 2026-08-18: **daemon-level events only, redacted.** Start, stop and
+   failures are logged; **guest output and project paths are not**. Full verbose logging stays
+   available as an explicit opt-in for someone actively debugging, and must not be the default.
+   The file is owner-only and size-bounded.
+
+   **What is still open about it is engineering, not product**: where the file lives, the exact
+   rotation policy and bound, what "redacted" means precisely for sandbox names, and how the
+   opt-in is expressed. Bring a proposal for those; do not re-litigate whether to log.
+
+   **The status quo it replaces, VERIFIED 2026-08-18:** the daemon's stderr goes to
+   `Stdio::null()` (`crates/gascan/src/client.rs:394`) unless `GASCAN_DAEMON_STDERR_PATH` is
+   set, and nothing sets it in production. A daemon that fails while running leaves no record.
+   (2a) and (2b) landing was the precondition, and they have landed.
 3. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
    session's four review files and the previous whole-landing review. Task 6 M3 and Task 7 O1
    are still open.
