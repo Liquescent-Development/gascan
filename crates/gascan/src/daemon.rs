@@ -25,6 +25,11 @@ use std::time::{Duration, Instant};
 /// constant rather than through a literal of their own.
 pub(crate) const STARTUP_DIAGNOSTIC_NAME: &str = "daemon-startup-error.json";
 const MAX_INSTANCE_BYTES: u64 = 64 * 1024;
+/// How long the supervisor waits between two looks at the same thing. Named
+/// once because `retry_while_raced` and `SupervisorTimeouts::default` must not
+/// drift apart -- a re-declared 25ms is the same class of duplicate the shared
+/// `gascan_core::daemon_protocol` exists to remove.
+const DEFAULT_POLL: Duration = Duration::from_millis(25);
 const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const ENDPOINT_CHANGED_DURING_PROBE: &str =
     "daemon endpoint pathname changed during the successful probe";
@@ -456,11 +461,19 @@ pub(crate) struct Inspection<C> {
     record: Option<DaemonInstanceRecord>,
     interrupted_tombstone: Option<InterruptedTombstone>,
     published_record: Option<InterruptedTombstone>,
+    /// Set when this observation failed because the path moved under it rather
+    /// than because it found something wrong. `retry_while_raced` looks again on
+    /// it; nothing else reads it.
+    raced: Option<String>,
 }
 
 impl<C> Inspection<C> {
     pub(crate) const fn status(&self) -> &DaemonStatus {
         &self.status
+    }
+
+    fn raced_detail(&self) -> Option<&str> {
+        self.raced.as_deref()
     }
 }
 
@@ -619,7 +632,7 @@ impl Default for SupervisorTimeouts {
         Self {
             readiness: Duration::from_secs(15),
             shutdown: Duration::from_secs(15),
-            poll: Duration::from_millis(25),
+            poll: DEFAULT_POLL,
         }
     }
 }
@@ -979,7 +992,91 @@ async fn probe_authenticated<E: DaemonEndpoint>(
     }
 }
 
+/// Observations of a path two processes share disagree sometimes, and a
+/// disagreement is not by itself a fault. `start_with` takes the lifecycle lock
+/// and `inspect` does not, so a status check can sample the record while a
+/// legitimate stop is rewriting it; every such disagreement used to be a
+/// terminal `DaemonState::Unsafe`, which is a verdict whose other members are
+/// symlink attacks and foreign ownership.
+///
+/// So a race-shaped failure is looked at again rather than believed. Three
+/// observations, because the windows this races with are a rename wide and one
+/// retry already clears them -- the third is margin, not expectation.
+///
+/// The lifecycle lock does not make this unnecessary under `start_with`. What
+/// that lock fences is the other CLI lifecycle callers; `gascand` publishes its
+/// record without taking it, and a daemon that outlived its spawner's readiness
+/// deadline -- or that was never CLI-spawned at all -- publishes with no lock
+/// held by anyone. `sweep_abandoned_staging` in `crates/gascand/src/socket.rs`
+/// names the same residue for the same reason.
+///
+/// **If it never settles, the verdict is `Unsafe`.** A path that will not stop
+/// changing is a fault, and the detail says which failure kept recurring.
 pub(crate) async fn inspect_with<E, P>(
+    paths: &DaemonPaths,
+    expected_executable: &Path,
+    endpoint: &E,
+    inspector: &P,
+) -> Result<Inspection<E::Connection>, SupervisorError>
+where
+    E: DaemonEndpoint,
+    P: ProcessInspector,
+{
+    const OBSERVATIONS: u32 = 3;
+
+    retry_while_raced(DEFAULT_POLL, OBSERVATIONS, || {
+        observe_once(paths, expected_executable, endpoint, inspector)
+    })
+    .await
+}
+
+/// Looks again while the last look was raced, and fails closed when the looking
+/// runs out.
+///
+/// Generic over the observation so that the retry decision -- which verdict is
+/// returned, which is looked at again, how a path that never settles is
+/// reported -- is provable from canned observations. Driving it through the
+/// filesystem instead would mean racing a test thread against `delay`, and a
+/// verdict decided by a wall clock is not a verdict this suite can hold.
+async fn retry_while_raced<C, F, Fut>(
+    delay: Duration,
+    observations: u32,
+    mut observe: F,
+) -> Result<Inspection<C>, SupervisorError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Inspection<C>, SupervisorError>>,
+{
+    let mut last_race: Option<String> = None;
+    for observation in 0..observations {
+        if observation > 0 {
+            tokio::time::sleep(delay).await;
+        }
+        let inspected = observe().await?;
+        match inspected.raced_detail() {
+            Some(detail) => last_race = Some(detail.to_owned()),
+            None => return Ok(inspected),
+        }
+    }
+    let detail = last_race.unwrap_or_else(|| "the daemon record kept changing".to_owned());
+    Ok(Inspection {
+        status: DaemonStatus {
+            state: DaemonState::Unsafe,
+            identity: None,
+            legacy: false,
+            detail: Some(format!(
+                "the daemon record was still changing after {observations} observations: {detail}"
+            )),
+        },
+        session: None,
+        record: None,
+        interrupted_tombstone: None,
+        published_record: None,
+        raced: None,
+    })
+}
+
+async fn observe_once<E, P>(
     paths: &DaemonPaths,
     expected_executable: &Path,
     endpoint: &E,
@@ -1006,6 +1103,7 @@ where
                     record: None,
                     interrupted_tombstone: None,
                     published_record: None,
+                    raced: race_marker(&error),
                 });
             }
         }
@@ -1030,6 +1128,7 @@ where
                 record: None,
                 interrupted_tombstone: Some(tombstone),
                 published_record: None,
+                raced: None,
             },
             EndpointProbe::Unresponsive(detail) => Inspection {
                 status: DaemonStatus {
@@ -1044,6 +1143,7 @@ where
                 record: None,
                 interrupted_tombstone: None,
                 published_record: None,
+                raced: None,
             },
             EndpointProbe::Connected(session) => Inspection {
                 status: DaemonStatus {
@@ -1058,6 +1158,7 @@ where
                 record: None,
                 interrupted_tombstone: Some(tombstone),
                 published_record: None,
+                raced: None,
             },
             EndpointProbe::Unsafe(detail) => Inspection {
                 status: DaemonStatus {
@@ -1070,6 +1171,7 @@ where
                 record: None,
                 interrupted_tombstone: None,
                 published_record: None,
+                raced: None,
             },
         });
     }
@@ -1087,6 +1189,7 @@ where
                 record: None,
                 interrupted_tombstone: None,
                 published_record: None,
+                raced: race_marker(&error),
             });
         }
     };
@@ -1105,6 +1208,7 @@ where
                     record,
                     interrupted_tombstone: None,
                     published_record: None,
+                    raced: race_marker(&error),
                 },
                 EndpointProbe::Connected(session) => Inspection {
                     status: DaemonStatus {
@@ -1117,6 +1221,7 @@ where
                     record,
                     interrupted_tombstone: None,
                     published_record: None,
+                    raced: race_marker(&error),
                 },
                 EndpointProbe::Unsafe(detail) => Inspection {
                     status: DaemonStatus {
@@ -1129,6 +1234,7 @@ where
                     record,
                     interrupted_tombstone: None,
                     published_record: None,
+                    raced: race_marker(&error),
                 },
             });
         }
@@ -1146,6 +1252,7 @@ where
             record,
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         },
         EndpointProbe::AbsentOrInert => classify_unreachable(paths, record, inspector).await?,
         EndpointProbe::Unresponsive(detail) => {
@@ -1220,6 +1327,7 @@ where
             record: None,
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         };
     }
     match inspected.status.state {
@@ -2571,6 +2679,7 @@ async fn classify_connected<C, P: ProcessInspector>(
         record,
         interrupted_tombstone: None,
         published_record: None,
+        raced: None,
     };
 
     if let Err(error) = validate_endpoint_identity(identity) {
@@ -2646,6 +2755,7 @@ async fn classify_connected<C, P: ProcessInspector>(
         record,
         interrupted_tombstone: None,
         published_record: None,
+        raced: None,
     })
 }
 
@@ -2666,6 +2776,7 @@ async fn classify_unreachable<C, P: ProcessInspector>(
             record,
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         });
     }
     let Some(record) = record else {
@@ -2675,6 +2786,7 @@ async fn classify_unreachable<C, P: ProcessInspector>(
             record: None,
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         });
     };
     let identity = DaemonIdentity::from(&record);
@@ -2685,6 +2797,7 @@ async fn classify_unreachable<C, P: ProcessInspector>(
             record: Some(record),
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         }),
         Ok(Some(process)) => match require_identity_match(&record, &process) {
             Ok(()) => Ok(Inspection {
@@ -2701,6 +2814,7 @@ async fn classify_unreachable<C, P: ProcessInspector>(
                 record: Some(record),
                 interrupted_tombstone: None,
                 published_record: None,
+                raced: None,
             }),
             Err(error) => Ok(Inspection {
                 status: DaemonStatus {
@@ -2713,6 +2827,7 @@ async fn classify_unreachable<C, P: ProcessInspector>(
                 record: Some(record),
                 interrupted_tombstone: None,
                 published_record: None,
+                raced: None,
             }),
         },
         Err(error) => Ok(Inspection {
@@ -2726,6 +2841,7 @@ async fn classify_unreachable<C, P: ProcessInspector>(
             record: Some(record),
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         }),
     }
 }
@@ -2751,6 +2867,7 @@ async fn classify_unresponsive<C, P: ProcessInspector>(
             record,
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         }),
         Err(error) => Ok(Inspection {
             status: DaemonStatus {
@@ -2763,6 +2880,7 @@ async fn classify_unresponsive<C, P: ProcessInspector>(
             record,
             interrupted_tombstone: None,
             published_record: None,
+            raced: None,
         }),
     }
 }
@@ -3247,6 +3365,15 @@ fn is_raced(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|inner| inner.is::<RacedObservation>())
+}
+
+/// The marker `observe_once` hangs on an `Inspection` it built from a failure,
+/// so that `retry_while_raced` can tell "the file moved while I looked" from
+/// "the file is wrong". Written once because every `Unsafe` verdict built from
+/// an `io::Error` inside `observe_once` must make the same judgement, and one of
+/// them silently deciding otherwise is the bug this retry exists to fix.
+fn race_marker(error: &io::Error) -> Option<String> {
+    is_raced(error).then(|| error.to_string())
 }
 
 fn instance_parent_and_name(path: &Path) -> io::Result<(&Path, &OsStr)> {
@@ -3786,15 +3913,16 @@ mod tests {
     use super::{
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
         DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
-        DaemonStartupMonitor, DaemonState, DaemonTransition, EndpointPathState, EndpointProbe,
-        EndpointSession, INSTANCE_TOMBSTONE_MODE, InstanceTimestamp, MAX_STARTUP_DIAGNOSTIC_BYTES,
-        OsProcessInspector, PRIVATE_FILE_MODE, ProcessIdentity, ProcessInspector, ProcessSignaler,
-        ShutdownPolicy, StopMode, SupervisorError, SupervisorTimeouts, checked_pid,
-        coherent_process_identity, connect_current_or_recover_with,
-        connect_current_or_recover_with_observer, inspect_with, is_raced,
-        open_interrupted_tombstone, open_published_record, raced, read_attested_instance,
-        read_instance_record_with_hook, restart_with, retire_held_record, signal_attested_with,
-        signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
+        DaemonStartupMonitor, DaemonState, DaemonStatus, DaemonTransition, EndpointPathState,
+        EndpointProbe, EndpointSession, INSTANCE_TOMBSTONE_MODE, Inspection, InstanceTimestamp,
+        MAX_STARTUP_DIAGNOSTIC_BYTES, OsProcessInspector, PRIVATE_FILE_MODE, ProcessIdentity,
+        ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode, SupervisorError,
+        SupervisorTimeouts, checked_pid, coherent_process_identity,
+        connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
+        is_raced, open_interrupted_tombstone, open_published_record, race_marker, raced,
+        read_attested_instance, read_instance_record_with_hook, restart_with, retire_held_record,
+        retry_while_raced, signal_attested_with, signal_attested_with_deadline, signal_identity,
+        start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
     use super::{inspect_process_with, parse_lsof_executable};
@@ -8125,5 +8253,193 @@ mod tests {
             "protected runtime file is unsafe: not a regular file",
         )));
         assert!(!is_raced(&io::Error::from(io::ErrorKind::NotFound)));
+    }
+
+    /// The wiring every `Unsafe` verdict that `observe_once` builds from an
+    /// `io::Error` uses: the detail is the message, and the retry marker is
+    /// whatever `race_marker` makes of the error. The retry tests build their
+    /// observations through this rather than setting `raced` by hand, so that a
+    /// change to `is_raced` reaches them instead of passing underneath them.
+    fn observation_of_failure(error: &io::Error) -> Inspection<()> {
+        Inspection {
+            status: DaemonStatus {
+                state: DaemonState::Unsafe,
+                identity: None,
+                legacy: false,
+                detail: Some(error.to_string()),
+            },
+            session: None,
+            record: None,
+            interrupted_tombstone: None,
+            published_record: None,
+            raced: race_marker(error),
+        }
+    }
+
+    fn settled_observation() -> Inspection<()> {
+        Inspection {
+            status: DaemonStatus::new(DaemonState::Stopped),
+            session: None,
+            record: None,
+            interrupted_tombstone: None,
+            published_record: None,
+            raced: None,
+        }
+    }
+
+    /// A reader that raced looks again and reports what the daemon settled into.
+    /// The race never reaches the user.
+    ///
+    /// The retry is driven with canned observations and a zero delay because the
+    /// alternative is a test thread racing `DEFAULT_POLL`, and a verdict decided
+    /// by a wall clock is not one this suite can hold. What the filesystem
+    /// proves here instead is the *marking*: the failure fed to the retry is the
+    /// one `open_published_record` itself returns when the record it was told to
+    /// bind is not the record on the path any more.
+    #[tokio::test]
+    async fn an_observation_that_races_once_then_settles_reports_the_settled_verdict() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let published = record(&executable);
+        write_record(&paths, &published)?;
+
+        // The race, sequenced by hand: the record is replaced after the reader
+        // read it and before the reader binds a descriptor to what it read.
+        let mut replacement = published.clone();
+        replacement.owner_token = "another-owner-token".to_owned();
+        write_record(&paths, &replacement)?;
+        let error = open_published_record(&paths, &published)
+            .err()
+            .ok_or("a substituted record must not bind as the record that was read")?;
+        assert!(
+            is_raced(&error),
+            "a record substituted under the reader is a race, not a fault: {error}"
+        );
+
+        let observations = AtomicUsize::new(0);
+        let inspected = retry_while_raced(Duration::ZERO, 3, || {
+            let first = observations.fetch_add(1, AtomicOrdering::SeqCst) == 0;
+            let observed = if first {
+                observation_of_failure(&error)
+            } else {
+                settled_observation()
+            };
+            async move { Ok(observed) }
+        })
+        .await?;
+
+        assert_eq!(
+            inspected.status.state,
+            DaemonState::Stopped,
+            "the settled observation is the verdict, not the race that preceded it: {:?}",
+            inspected.status.detail
+        );
+        assert_eq!(
+            observations.load(AtomicOrdering::SeqCst),
+            2,
+            "a raced observation must be looked at again exactly once here"
+        );
+        Ok(())
+    }
+
+    /// A path that never settles is not a race any more. Fail closed, and name
+    /// the failure that kept recurring.
+    ///
+    /// The recurring failure is the one `validate_instance_tombstone` itself
+    /// returns when the inert tombstone it was handed a stat of has been renamed
+    /// over before it opens the name -- the publisher's own rename, sequenced by
+    /// hand so that no clock decides the outcome.
+    #[tokio::test]
+    async fn an_observation_that_never_settles_is_unsafe_and_says_so() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let tombstone_mode = u32::from(INSTANCE_TOMBSTONE_MODE);
+        fs::write(paths.instance(), b"")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(tombstone_mode))?;
+        let (parent, name) = super::instance_parent_and_name(paths.instance())?;
+        let directory = super::open_private_directory_with_mode(parent, paths.expected_uid, false)?;
+        let stale = rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+
+        // Staged beside the name and then renamed over it, so the replacement's
+        // inode is allocated while the original still holds one: the two cannot
+        // collide, and the substitution needs no timing to be real.
+        let staged = paths.instance().with_extension("staged");
+        fs::write(&staged, b"")?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(tombstone_mode))?;
+        fs::rename(&staged, paths.instance())?;
+
+        let error =
+            super::validate_instance_tombstone(&directory, name, &stale, paths.expected_uid)
+                .err()
+                .ok_or("a substituted tombstone must not validate as the one that was stat'd")?;
+        assert!(
+            is_raced(&error),
+            "a tombstone renamed over under the reader is a race, not a fault: {error}"
+        );
+
+        let observations = AtomicUsize::new(0);
+        let inspected = retry_while_raced(Duration::ZERO, 3, || {
+            observations.fetch_add(1, AtomicOrdering::SeqCst);
+            let observed = observation_of_failure(&error);
+            async move { Ok(observed) }
+        })
+        .await?;
+
+        assert_eq!(inspected.status.state, DaemonState::Unsafe);
+        let detail = inspected
+            .status
+            .detail
+            .as_deref()
+            .ok_or("a verdict that never settled must say so")?;
+        assert!(
+            detail.contains("still changing after 3 observations"),
+            "the verdict must say the looking ran out: {detail}"
+        );
+        assert!(
+            detail.contains("daemon instance tombstone changed while opening it"),
+            "the verdict must name the failure that kept recurring: {detail}"
+        );
+        assert_eq!(
+            observations.load(AtomicOrdering::SeqCst),
+            3,
+            "every observation is spent before the reader gives up"
+        );
+        Ok(())
+    }
+
+    /// A failure nobody classified is the verdict on the first observation and is
+    /// never looked at again. That is the fail-closed default, and `is_raced` is
+    /// the only thing separating it from a retry -- so this drives a real
+    /// unclassified `io::Error` through the same wiring `observe_once` uses,
+    /// which is what makes it fail if `is_raced` ever starts saying yes.
+    #[tokio::test]
+    async fn an_unclassified_failure_is_the_verdict_on_the_first_observation() -> TestResult {
+        let unsafe_file = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "protected runtime file is unsafe: not a regular file",
+        );
+        let observations = AtomicUsize::new(0);
+        let inspected = retry_while_raced(Duration::ZERO, 3, || {
+            observations.fetch_add(1, AtomicOrdering::SeqCst);
+            let observed = observation_of_failure(&unsafe_file);
+            async move { Ok(observed) }
+        })
+        .await?;
+
+        assert_eq!(inspected.status.state, DaemonState::Unsafe);
+        assert_eq!(
+            inspected.status.detail.as_deref(),
+            Some("protected runtime file is unsafe: not a regular file"),
+            "an unclassified failure is reported as itself, not as a path that would not settle"
+        );
+        assert_eq!(
+            observations.load(AtomicOrdering::SeqCst),
+            1,
+            "an unclassified failure must be terminal on the first observation"
+        );
+        Ok(())
     }
 }
