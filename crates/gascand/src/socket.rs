@@ -281,11 +281,41 @@ where
         // create at the name -- its commit is `NOREPLACE` and ours occupies the
         // name -- and it cannot reach that commit at all, because
         // `clear_inert_destination` refuses anything that is not 0200-and-empty
-        // and ours is 0600-with-content. `gascan` never creates or renames a
-        // node at this path; its reclaim only edits a descriptor it already
-        // holds. And two live daemons are excluded upstream anyway, by
-        // `prepare_socket` refusing `AddrInUse` against a live socket before
-        // either one reaches this file.
+        // and ours is 0600-with-content.
+        //
+        // ~~`gascan` never creates or renames a node at this path; its reclaim
+        // only edits a descriptor it already holds.~~ **Corrected: both halves
+        // stopped being true.** `retire_held_record` in
+        // `crates/gascan/src/daemon.rs` stages a `.reclaim-` file in this
+        // directory and renames it over this name, for the same reason this
+        // function does -- chmod-then-truncate on a live record is the illegal
+        // fourth face, wherever it is written. So the CLI is a second writer of
+        // this name and that leg is gone.
+        //
+        // What replaces it does not argue the interleaving impossible; it
+        // argues it harmless. Both writers commit an inert 0200-and-empty
+        // tombstone, so whichever rename lands second, the destination a reader
+        // samples is a legal tombstone and never the fourth face. Neither
+        // writer touches the destination after its own rename -- each only
+        // edits the descriptor it already holds. And the CLI does the same
+        // check-then-act this comment defends, comparing the name against the
+        // inode its recovery validated on the line above its rename: if this
+        // function's tombstone reaches the name first, the CLI refuses instead
+        // of overwriting it; if the CLI's reaches the name before the
+        // `identity_at` check above, that check fails and this function does
+        // not rename at all; and in the one remaining order -- the CLI's
+        // landing inside this very window -- this rename replaces one inert
+        // tombstone with another. The CLI notices it lost, because it compares
+        // the name against the inode it staged afterwards and reports
+        // `TombstoneChanged`; this function does not check, which costs nothing
+        // because the name holds a legal tombstone in every ordering.
+        //
+        // Most of this is fenced anyway by the lifecycle lock the CLI holds
+        // across the whole of its recovery; `sweep_abandoned_staging` below
+        // names the `gascand`s that fence does not cover, and the argument
+        // above is what covers them. And two live daemons are excluded upstream
+        // anyway, by `prepare_socket` refusing `AddrInUse` against a live
+        // socket before either one reaches this file.
         rustix::fs::renameat(directory, staging.as_str(), directory, name).map_err(errno)?;
         guard.disarm();
         drop(guard);

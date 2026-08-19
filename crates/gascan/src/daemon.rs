@@ -1505,6 +1505,68 @@ fn stage_inert_reclaim_file(
     }
 }
 
+/// What a name resolves to right now, with no judgement about whether the file
+/// there is legal.
+///
+/// Deliberately not `file_identity_at`, which runs `validate_file_stat` and so
+/// refuses `(0200, content)` -- the exact destination retirement exists to
+/// replace. A check that cannot look at the state it is guarding is not a
+/// check.
+fn raw_identity_at<S: rustix::path::Arg>(directory: &OwnedFd, name: S) -> io::Result<FileIdentity> {
+    let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+    Ok(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+    })
+}
+
+/// Unlinks the reclaim staging file unless the retirement that created it
+/// commits.
+///
+/// Retirement has four exits between staging and the commit -- an `fsync`
+/// failure, a destination that is no longer the record, a failed rename, and
+/// whatever a later edit adds -- and a hand-written `unlinkat` on each is the
+/// shape that grows an uncovered one. `crates/gascand/src/socket.rs` uses
+/// `StagingGuard` for the same reason; this is `gascan`'s, separate only
+/// because the two crates do not share an identity type.
+///
+/// It removes the *staging* name and only while that name still resolves to
+/// the inode it staged, so it can reach neither the destination nor a file
+/// somebody else has since put under that name.
+struct ReclaimStagingGuard<'a> {
+    directory: &'a OwnedFd,
+    name: &'a str,
+    identity: FileIdentity,
+    armed: bool,
+}
+
+impl<'a> ReclaimStagingGuard<'a> {
+    const fn new(directory: &'a OwnedFd, name: &'a str, identity: FileIdentity) -> Self {
+        Self {
+            directory,
+            name,
+            identity,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReclaimStagingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if raw_identity_at(self.directory, self.name).is_ok_and(|current| current == self.identity)
+        {
+            let _ = rustix::fs::unlinkat(self.directory, self.name, AtFlags::empty());
+        }
+    }
+}
+
 fn reclaim_staging_name() -> Result<String, SupervisorError> {
     let mut bytes = [0_u8; 7];
     getrandom::fill(&mut bytes).map_err(|error| SupervisorError::Io(io::Error::other(error)))?;
@@ -1531,16 +1593,49 @@ fn reclaim_staging_name() -> Result<String, SupervisorError> {
 fn retire_held_record(record: &InterruptedTombstone) -> Result<(), SupervisorError> {
     let (staged, staging, staged_identity) =
         stage_inert_reclaim_file(&record.directory, record.expected_uid)?;
+    let mut guard = ReclaimStagingGuard::new(&record.directory, &staging, staged_identity);
     staged.sync_all()?;
-    if let Err(error) = rustix::fs::renameat(
+    // Check-then-act, and the check is what makes the act legitimate. The
+    // rename below is not `NOREPLACE` -- retirement must replace, that is the
+    // whole job -- so it overwrites whatever is at the name at that instant,
+    // and nothing downstream can tell that it did. `validate_retired_tombstone`
+    // compares the destination against the inode *this function* staged, not
+    // against the record, and `empty_unlinked_inode` accepts `st_nlink == 0`,
+    // which is just as true when somebody else did the unlinking. So without
+    // this comparison a replacement arriving after the caller's last
+    // `validate_held_*` is silently clobbered and every post-condition passes.
+    // `crates/gascand/src/socket.rs` guards its own non-`NOREPLACE` rename the
+    // same way, on the line above it.
+    //
+    // The staging above widened the window this closes: the old two-syscall
+    // edit began with an `fchmod` on a descriptor already held, whereas an
+    // `openat`, `fchmod`, `fstat` and a full `fsync` now run first.
+    //
+    // Comparing inode numbers is sound here only because `record.file` is still
+    // open: the kernel cannot recycle that inode number while this process
+    // holds a descriptor on it, so a match is the record itself and not a
+    // successor wearing its number.
+    let at_name = raw_identity_at(&record.directory, record.name.as_os_str()).map_err(|error| {
+        SupervisorError::TombstoneChanged {
+            detail: error.to_string(),
+        }
+    })?;
+    if at_name != record.identity {
+        return Err(SupervisorError::TombstoneChanged {
+            detail: "the pathname stopped naming the record this retirement validated".to_owned(),
+        });
+    }
+    rustix::fs::renameat(
         &record.directory,
         staging.as_str(),
         &record.directory,
         record.name.as_os_str(),
-    ) {
-        let _ = rustix::fs::unlinkat(&record.directory, staging.as_str(), AtFlags::empty());
-        return Err(SupervisorError::Io(errno(error)));
-    }
+    )
+    .map_err(|error| SupervisorError::Io(errno(error)))?;
+    // Committed: the staging name is gone, so there is nothing left to clean up
+    // and every exit below must leave the destination alone.
+    guard.disarm();
+    drop(guard);
     // The rename unlinked the record, so nothing can reach it by name and
     // emptying it is invisible at the path.
     empty_unlinked_inode(&record.file)?;
@@ -1557,7 +1652,9 @@ fn retire_held_record(record: &InterruptedTombstone) -> Result<(), SupervisorErr
 /// identical whether the truncation happens before or after the rename --
 /// MEASURED by hoisting the truncation above the rename and re-running
 /// `cargo test -p gascan --lib -- tombstone_recovery_ stale_record_recovery_
-/// retirement_replaces`: 8 passed, 0 failed. The difference is only visible to
+/// retirement_replaces`: 8 passed, 0 failed. That filter selected eight tests
+/// when the measurement was taken; the ninth arrived later, with the pre-rename
+/// identity check in `retire_held_record`. The difference is only visible to
 /// a concurrent reader during the window, which no test in this tree opens. So
 /// the precondition is checked at the moment it matters, and travels with the
 /// syscall it guards rather than sitting beside it where a later edit can
@@ -1667,9 +1764,19 @@ fn validate_held_published_record(
 
 /// Prove the retirement reached its two ends. The old form asserted one inode
 /// was still at the name; a rename unlinks it, so that is now unsatisfiable by
-/// construction. The replacement is strictly stronger: it proves the record is
-/// gone from the namespace, that its bytes are destroyed, and that what stands
-/// in its place is legal.
+/// construction.
+///
+/// ~~The replacement is strictly stronger.~~ **Corrected: it trades one
+/// dimension away for two.** Stronger in proving the record's bytes are
+/// destroyed and that it is out of the namespace -- neither of which the old
+/// form checked at all. Weaker in exactly one: the old form compared the inode
+/// at the name against `record.identity`, so reaching `Ok` meant the name still
+/// held the inode the recovery had validated. Comparing against
+/// `staged_identity` cannot say that, because this retirement's own rename put
+/// that inode there whether or not the record was still at the name when it
+/// did. What restores the causal link is the identity check immediately before
+/// the rename in `retire_held_record`, and it has to live there rather than
+/// here: by the time this function runs the evidence is gone.
 fn validate_retired_tombstone(
     record: &InterruptedTombstone,
     staged: &File,
@@ -5905,6 +6012,57 @@ mod tests {
         assert_eq!(
             held_after.st_size, 0,
             "the retired inode still holds its bytes"
+        );
+        Ok(())
+    }
+
+    /// The sibling of `tombstone_recovery_never_mutates_a_pathname_replacement`,
+    /// covering the arrival time that test cannot reach. That one injects its
+    /// replacement during a probe, inside the window the caller's
+    /// `validate_held_*` still closes over. This one injects after the last of
+    /// those validations has passed and the descriptor is already held -- the
+    /// instant retirement itself owns, where the only thing between a
+    /// replacement and an unconditional rename is retirement's own check.
+    #[tokio::test]
+    async fn retirement_refuses_a_replacement_that_arrives_after_the_final_validation() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        fs::write(paths.instance(), b"a-record-with-a-token")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
+
+        let held =
+            open_interrupted_tombstone(&paths)?.ok_or("expected an interrupted tombstone")?;
+
+        // Every validation the recovery callers perform has now passed. A
+        // replacement that arrives here is invisible to all of them.
+        let replacement = b"replacement-owned-elsewhere".to_vec();
+        fs::remove_file(paths.instance())?;
+        fs::write(paths.instance(), &replacement)?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
+
+        let result = retire_held_record(&held);
+        assert!(
+            matches!(result, Err(SupervisorError::TombstoneChanged { .. })),
+            "retirement renamed over a file it had never validated: {result:?}",
+        );
+        assert_eq!(
+            fs::read(paths.instance())?,
+            replacement,
+            "the replacement's bytes did not survive the refusal",
+        );
+
+        let prefix = format!(".{}-", super::RECLAIM_STAGING_PURPOSE);
+        let residue = fs::read_dir(paths.directory())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| name.to_string_lossy().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "the refusal left reclaim staging behind: {residue:?}",
         );
         Ok(())
     }
