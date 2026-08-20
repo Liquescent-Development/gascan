@@ -9,8 +9,7 @@ from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual 
 retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
 merged**. Everything above the `Where the work is` heading is current; everything below it is
 history, **with three exceptions added 2026-08-19 that are current**: the sections headed
-`THE FOURTH MECHANISM`, `THE FIFTH MECHANISM`, `THE SIXTH MECHANISM` and
-`THE SEVENTH MECHANISM`, which describe live CI flakes.
+`THE FOURTH MECHANISM` through `THE EIGHTH MECHANISM`, which describe live CI flakes.
 
 ---
 
@@ -93,12 +92,15 @@ there before assuming anything named in this file is still open.
 **THE READER HALF IS DONE, SO THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
 and the maintainer chooses from it:
 
-1. **The four unfixed CI flake mechanisms this file names** — the empty pid-file read, the
+1. **The five unfixed CI flake mechanisms this file names** — the empty pid-file read, the
    `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
-   collision, and a `lifecycle` container left `Running` after a rejected `up`. All four are
-   written up under the headings `THE FOURTH MECHANISM` through `THE SEVENTH MECHANISM`, which
-   sit *below* the `Where the work is` heading despite being current. **Note the last two are
-   different tests in the same target**, so "the `lifecycle` flake" is not one thing.
+   collision, a `lifecycle` container left `Running` after a rejected `up`, and a 250ms
+   wall-clock bound in `gascan-e2e`'s PTY signal test. All five are written up under the headings
+   `THE FOURTH MECHANISM` through `THE EIGHTH MECHANISM`, which sit *below* the
+   `Where the work is` heading despite being current. **Two of them are different tests in the
+   same `lifecycle` target**, so "the `lifecycle` flake" is not one thing — and **the eighth is
+   the only one whose fix does not require diagnosing a race first**, because its pass condition
+   is simply that the machine was fast enough. Start there.
 2. **Item 2c, the daemon's production log.** Decided 2026-08-18 — daemon-level events only,
    redacted, verbose logging as an explicit opt-in — and unbuilt. What remains is engineering, not
    product; the decision must not be re-litigated. See open item 2.
@@ -3093,6 +3095,40 @@ reader classification. `git diff --name-only 8613f22 93c77fe` returns only
 consecutive times locally with `cargo test -p gascand --test lifecycle
 retained_ssh_host_key_failure_removes_prior_alias_before_stop`, 1 passed 0 failed each time, and
 the full `cargo test --workspace` at that commit reported 85 suites, 1534 passed, 0 failed.
+
+**THE EIGHTH MECHANISM, FOUND 2026-08-19: a wall-clock bound in `gascan-e2e`'s PTY signal
+test.** The `rust` job of run on PR #87 at `ec47492` failed with:
+
+```
+---- apple_common::tests::pty_signal_driver_does_not_wait_for_inherited_slave_descriptor stdout ----
+panicked at crates/gascan-e2e/tests/apple_common/mod.rs:4562:9:
+signal helper waited 420.525083ms for an inherited PTY slave descriptor
+test result: FAILED. 75 passed; 1 failed; 8 ignored; 0 measured; 0 filtered out; finished in 8.12s
+```
+
+**Unlike the other seven, this one's shape is visible in the source rather than guessed.** The
+assertion at `crates/gascan-e2e/tests/apple_common/mod.rs:4562` is
+`started.elapsed() < std::time::Duration::from_millis(250)` — a bound on wall-clock time. It
+measured 420ms. That the bound is wall-clock is a fact about the code; **why the machine took
+420ms is not diagnosed and must not be written down as though it were.**
+
+What this does license, and it is the only mechanism here that licenses anything: a test whose
+pass condition is "the machine was fast enough" will fail on a shared runner eventually,
+whatever the code does. Whoever takes the flake work should decide whether that assertion wants
+a larger bound, a different instrument, or to be `#[ignore]`d in CI — that is a design call, not
+a diagnosis, and it is the one place in this list where the fix does not require finding a race
+first.
+
+Exonerated by diff: `git diff --name-only cfcfb62 ec47492` returns `docs/status/START-HERE.md`
+and nothing else.
+
+**THE PATTERN ACROSS THE LAST THREE RUNS ON THIS BRANCH IS WORTH MORE THAN ANY ONE OF THEM.**
+At `93c77fe`, `cfcfb62` and `ec47492` the `rust` job failed on **three different tests in three
+different crates** — `gascand`'s `lifecycle`, `gascand`'s `reconcile`, and `gascan-e2e`'s
+`apple_common` — and **the last two commits contain no code at all**. A green `rust` on this
+branch is currently the exception, and the local `cargo test --workspace` (85 suites, 1534
+passed, 0 failed at `93c77fe`) is the signal that means anything. Do not read a red `rust` here
+as evidence about a branch until `git diff --name-only` has been run against the failing commit.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
