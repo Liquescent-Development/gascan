@@ -4,21 +4,135 @@ This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
 Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day after the daemon
-instance record's publish race was fixed and merged (PR #80, #81). Everything above the
-`Where the work is` heading is current; everything below it is history.
+instance record's publish race was fixed and merged (PR #80, #81). Updated again 2026-08-19,
+from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
+retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
+merged**. Updated again the same day after two review rounds closed it and CI went green.
+Everything above the `Where the work is` heading is current; everything below it is
+history, **with six exceptions added 2026-08-19 that are current**: the sections headed
+`THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which describe live CI flakes — and the
+ninth is about the *local* suite, so read it before trusting a green local run.
 
 ---
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**Item 9 is merged. Both repositories are on `main` with clean worktrees and nothing is in
-flight.** Verify with `git log -1` and `git status`; do not trust a SHA in this file, which has
-gone stale on its own SHAs repeatedly.
+**PR #87 IS OPEN, THE READER HALF IS COMPLETE, TWO REVIEW ROUNDS ARE DISCHARGED, AND CI IS
+GREEN. IT IS NOT MERGED — that is the maintainer's call and the only thing left on it.** Branch
+`fix/daemon-reader-retryable-verdict` carries open item 1 entire, producer and reader. At the
+time of writing it is **33 commits off `main` at merge-base `61f1b3c`**
+(`git merge-base main fix/daemon-reader-retryable-verdict` →
+`61f1b3c64b10decbd6548543d9e6bfccbcdac048`), head `903ef05`. At that head `gh pr checks 87`
+reported `gate`, `rust`, `contracts` and `changes` all SUCCESS with `engine` skipping, and
+`gh pr view 87` reported **`mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`, not a draft**.
 
-**Your assignment is open item 1's residual: the reader's half of the daemon instance record.**
-The maintainer chose it on 2026-08-18. Its brief is under `THE ONE THING TO DO NEXT` below.
-Item 2c is no longer an open decision — it was decided the same day and is now an unstarted
-implementation with a specified shape.
+The commit carrying this sentence makes it 34 and moves the head, which is the staleness this
+file keeps warning about arriving inside the warning again — so **re-derive every one of those
+with `gh pr view 87`, `gh pr checks 87`, `git log -1` and `git status`** rather than believing
+the numbers above. Note also that the green is one CI run rather than a property of the branch;
+see `THE NINTH MECHANISM` before treating it as more.
+
+**BOTH REVIEWS ARE COMMITTED, and they are the two documents to read if you are deciding whether
+to merge:** `docs/status/review-daemon-reader-half.md` (round one — found the Critical) and
+`docs/status/review-daemon-reader-fixes.md` (round two — found none, confirmed the fix held).
+They carry their own measurements, including several this file only summarises, and round two's
+"Checked and found sound" section records what was attacked and survived, which is the part worth
+having before anyone re-opens a settled question.
+
+**IF YOU ARE PICKING THIS UP COLD, THE DECISION IN FRONT OF YOU IS "MERGE OR NOT", NOT "WHAT IS
+LEFT TO BUILD".** Nothing on the reader half is outstanding. Two independent reviews ran — the
+first found a Critical on the production path, the second found none and confirmed the fix held —
+and every finding from both is fixed with a test that fails when the fix is reverted, except five
+defensive branches recorded as uncovered on purpose. Merge is merge-only, never squash. After
+that, the queue below is the work.
+
+**THE ASSIGNMENT THAT STOOD HERE IS DONE, AND THE HEADLINE IT LEFT BEHIND WAS WRONG IN ONE
+DIRECTION THAT MATTERS.** The residue this file enumerated named the "0200 and empty" fault and
+the `EACCES` as the motivating case's tears. It missed the largest one. MEASURED at `bf107a1`
+with a temporary probe not retained in the tree — one reader spinning on
+`read_instance_record_for_inspection` against a publish-and-retire loop, over five seconds:
+
+| unmarked fault | samples |
+|---|---|
+| `link count is not one (mode 0600, links 0)` | **2426** |
+| `mode is 0200 and the file is empty` | 1138 |
+| bare `EACCES` from the `O_RDONLY` `openat` | 11 |
+
+The `nlink == 0` tear — the reader still holding the inode a rename unlinked — was the *most
+common* way a `gascan status` tore across an ordinary stop, and it was in neither the residue
+list nor the design. It was found by writing the end-to-end test the file admitted did not
+exist, which is the lesson worth carrying: the enumeration in a handoff doc is a hypothesis.
+
+**WHAT LANDED, all in `ae03597`.** The file being guarded is now a parameter, `GuardedFile`
+(`LifecycleLock` | `InstanceRecord`), threaded through `validate_file_stat`, `validate_open_file`
+and `file_identity_at`; the faults became values, and `StatFault::is_transitional_for` holds the
+**entire** widening in one function — `Unlinked` and `InertTombstone`, for `InstanceRecord` only.
+Production `raced()` constructor sites went from 5 to **16**; count them yourself with
+`awk 'NR<4450 && /raced\(/' crates/gascan/src/daemon.rs` rather than trusting either number.
+
+**What deliberately did NOT move, and this is the line to defend:** `0200` *with content* stays
+terminal, per the three-face rule — nothing will finish that record, so a retry would report a
+permanently stuck one as a passing squall. Foreign owner, non-regular file, extra hard links and
+wrong modes stay terminal everywhere, the instance record included. The lifecycle lock treats
+every fault as a fault, including the two that are transitions for the record, and
+`the_lifecycle_lock_treats_every_fault_as_terminal` is what holds that.
+
+**The retry composition is sealed.** `observe::sealed` holds `inspect_with_hook`,
+`retry_while_raced` and `observe_once_with_hook`; only the first leaves the module. The mutation
+the previous review measured as silently green — rewriting `inspect_with`'s delegation to call
+the observation directly — is now a compile error, VERIFIED: `cargo build -p gascan` fails with
+E0425, ``cannot find function `observe_once_with_hook` in module `observe` ``. Note the review's
+premise was off by one: `inspect_with_hook` has **two** legitimate callers, not one —
+`inspect_with` and `ensure_started_locked_with_hook`'s readiness loop.
+
+**All five review minors are now fixed**, not four; the fifth was the module seal above. Three of
+the other four are held by a test that fails when the fix is reverted; `stage_inert_reclaim_file`'s
+staging-name check is not, and is listed with the uncovered branches below.
+
+**A second review round on `bf107a1..8613f22` found a Critical this file had already declared
+closed, and it was on the production path.** `open_published_record`'s `openat` was unclassified,
+so an ordinary stop still produced terminal `Unsafe` verdicts — MEASURED, 4456 of them in 20,000
+observations, 100% of the unmarked ones. The cause was that the completeness claim rested on a
+loop test reading one layer *below* what a production observation does. Fixed, along with four
+other findings, in the commit that follows `8613f22`. Read open item 1 for the full account; the
+methodological point is repeated there because it has now cost this branch twice.
+
+**VERIFIED at `2a622f0`, on a machine with no leaked load on it:** `cargo fmt --all --check`
+exit 0, `cargo clippy --workspace --all-targets -- -D warnings` clean, and a complete
+`cargo test --workspace` — **85 suites, 1534 passed, 0 failed**, exit 0. The three race loops
+were additionally swept at 30,000 cycles and the observation loop three times at 40,000, none
+producing an unmarked failure; they are committed at 4096, where a mutation of either dominant
+classification is caught 3 of 3. **CI status at any later head must be re-derived — do not trust
+a "green" written here**, and read `THE NINTH MECHANISM` before treating one green local run as
+more than a data point.
+
+**Five defensive branches are recorded as NOT covered by a driving test, deliberately and not by
+oversight.** Two were listed by the first review — `empty_unlinked_inode`'s `st_nlink != 0`
+refusal and `validate_retired_tombstone`'s rename check. Three came out of this work:
+`stage_inert_reclaim_file`'s staging-name check and the **cleanup guard beside it** (a second
+review MEASURED both directions of that guard — deleting it, and inverting it so it unlinks
+precisely a stranger's file — leaving `cargo test -p gascan --lib` green at 324 both times), and
+`open_published_record`'s recheck-`statat` `ENOENT` split. All five are unreachable by
+construction on every path traced. Open item 1 has been rewritten end to end; read it there before
+assuming anything named in this file is still open.
+
+**THE READER HALF IS DONE, SO THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
+and the maintainer chooses from it:
+
+1. **The six unfixed flake mechanisms this file names** — the empty pid-file read, the
+   `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
+   collision, a `lifecycle` container left `Running` after a rejected `up`, and a 250ms
+   wall-clock bound in `gascan-e2e`'s PTY signal test, and four flaky tests in `gascan --lib`
+   itself. All six are written up under the headings
+   `THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which sit *below* the
+   `Where the work is` heading despite being current. **Two of them are different tests in the
+   same `lifecycle` target**, so "the `lifecycle` flake" is not one thing — and **the eighth is
+   the only one whose fix does not require diagnosing a race first**, because its pass condition
+   is simply that the machine was fast enough. Start there.
+2. **Item 2c, the daemon's production log.** Decided 2026-08-18 — daemon-level events only,
+   redacted, verbose logging as an explicit opt-in — and unbuilt. What remains is engineering, not
+   product; the decision must not be re-litigated. See open item 2.
+
 **You do not need the milestone-4 design, plan, or ledger** — that table is context for the
 milestone that closed, not a reading list. The one document you must read before touching
 anything about *offline* is `docs/evidence/2026-08-18-arca-engine-offline.md`.
@@ -155,27 +269,32 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### THE ONE THING TO DO NEXT
 
-**YOUR ASSIGNMENT IS OPEN ITEM 1'S RESIDUAL: THE READER HAS NO RETRYABLE VERDICT.** The
-maintainer chose it on 2026-08-18, over fixing the CI flakes and over the four small gaps,
-because it is a wrong answer a user can actually see. Item 9 is done and merged; its record is
-immediately below. The full statement of what is left is under `WHAT IS OPEN` item 1.
+**THAT ASSIGNMENT — OPEN ITEM 1'S RESIDUAL, "THE READER HAS NO RETRYABLE VERDICT" — WAS
+EXECUTED.** The maintainer chose it on 2026-08-18 over fixing the CI flakes and over the four
+small gaps, because it was a wrong answer a user could actually see. It is implemented on branch
+`fix/daemon-reader-retryable-verdict` off base `61f1b3c` (`git log -1 --format=%p 3e2cc9e`, the
+branch's first commit, returns `61f1b3c`), in eight reviewed tasks (more commits than that — count
+them with `git log --oneline main..fix/daemon-reader-retryable-verdict`, do not trust a number
+written here), **and that branch is open as PR #87 and deliberately not merged.** Why, and what
+finishing it means, is in the cold-start block at the top of this file. The full record of what
+changed, what it measured, and what it knowingly left is under `WHAT IS OPEN` item 1 — read that,
+not this summary.
 
-**The user-visible shape of it, VERIFIED 2026-08-18 by reading the code rather than the
-tracker:** `start_with` takes the lifecycle lock (`crates/gascan/src/daemon.rs:1161`) and
-`inspect` does not (`:1969`), so a `gascan status` run concurrently with a legitimate stop can
-sample the record mid-transition. Every disagreement between two of the reader's observations
-is terminal — `validate_instance_tombstone` returns a terminal `PermissionDenied` if a
-successor published in between, and `open_published_record` reports a legitimate concurrent
-stop as `Unsafe`. None of them is retryable. The job is to teach the reader the difference
-between "I raced with a normal transition" and "something is actually wrong".
+**The shape it had, kept because it is what the fix is answering:** `start_with` takes the
+lifecycle lock and `inspect` does not, so a `gascan status` run concurrently with a legitimate
+stop can sample the record mid-transition. Every disagreement between two of the reader's
+observations was terminal — `validate_instance_tombstone` returned a terminal `PermissionDenied`
+if a successor published in between, and `open_published_record` reported a legitimate concurrent
+stop as `Unsafe`. The job was to teach the reader the difference between "I raced with a normal
+transition" and "something is actually wrong", and the answer was a marker on race-shaped
+failures plus a retry of the whole observation sequence, terminal by default.
 
-**The known hard part, and it is why this was not folded into the publish-race fix:**
-`retire_held_record` (`crates/gascan/src/daemon.rs:1456-1460`, `fchmod(0200)` then
-`ftruncate(0)`, VERIFIED still in that order) cannot simply be staged-and-renamed like the
-publisher was, because `validate_retired_tombstone` requires the held descriptor's inode to
-still be *at the name* and a rename unlinks it. Changing that is a design change to the reclaim
-protocol. **Brainstorm the design before writing code, and do not weaken
-`validate_retired_tombstone` to make a rename fit.**
+**The known hard part was real and is where the design went.** `retire_held_record` could not
+simply be staged-and-renamed like the publisher was, because `validate_retired_tombstone`
+required the held descriptor's inode to still be *at the name* and a rename unlinks it. It was
+not weakened to make a rename fit: it was rewritten against two identities, and the one guarantee
+that rewrite could not keep — that the inode at the name is the one the recovery validated — was
+restored by a separate check-then-act immediately before the rename. Open item 1 has the detail.
 
 ### ITEM 9 IS DONE AND MERGED.
 
@@ -191,10 +310,26 @@ deliberate.** It was `SOCKET_MODE` in `gascand` and `FILE_MODE` in `gascan`, and
 covers four things: the socket, the published instance record, the lifecycle lock and the
 startup diagnostic. Each old name was true of one of the four. The other five kept their names.
 
-**The two adjacent constants did not move.** `INSTANCE_STAGING_PURPOSE` stayed in `socket.rs`
-and `STARTUP_DIAGNOSTIC_NAME` stayed in `daemon.rs`, each now carrying a comment saying why it
-is not shared. `STARTUP_DIAGNOSTIC_NAME` became `pub(crate)` so the four hard-coded literals in
-`crates/gascan/src/client.rs` name it through the constant.
+**One of the two adjacent constants stayed put; the other has since moved, and the reason it
+moved is worth keeping.** `STARTUP_DIAGNOSTIC_NAME` is still in `daemon.rs`, still carrying the
+comment saying why it is not shared, and it became `pub(crate)` so the **two** hard-coded
+occurrences of it in `crates/gascan/src/client.rs` name it through the constant. **Corrected:
+this sentence said "the four hard-coded literals" — four is the count for that file, not for
+this constant.** Two of the four were the startup diagnostic's name and go through
+`STARTUP_DIAGNOSTIC_NAME`; the other two were the instance record's name and go through
+`gascan_core::daemon_protocol::INSTANCE_NAME`. VERIFIED at the pre-item-9 base:
+`git grep -c daemon-startup-error 3cf98b5 -- crates/gascan/src/client.rs` returns 2, and the
+same command for `daemon-instance` returns 2. Both pairs sit in the two `DaemonLaunch`-building
+blocks in that file; grep for the two constant names rather than trusting a line number.
+
+`INSTANCE_STAGING_PURPOSE` was left in `socket.rs` by item 9 on the argument that `gascand` was
+the only stager. That argument expired: on branch `fix/daemon-reader-retryable-verdict` the
+CLI's retirement became a second stager, so `INSTANCE_STAGING_PURPOSE` moved into
+`gascan_core::daemon_protocol` beside a new `RECLAIM_STAGING_PURPOSE`, both are pinned in
+`crates/gascan-core/tests/daemon_protocol.rs` — including an `assert_ne!` that they differ, so a
+stray file says which process left it — and `sweep_abandoned_staging` sweeps both prefixes. **The
+lesson generalises: "only one caller needs it" is a fact about today, not a reason not to
+share.**
 
 **THE RESULT WORTH CARRYING FORWARD IS THAT THE ACCEPTANCE BAR IN THE OLD BRIEF WAS NOT
 REACHABLE AS WRITTEN, AND MEASURING IT SHOWED WHY.** The brief said a value change in
@@ -286,17 +421,24 @@ nor any ssh path is in it; and the test passes alone, 2/2. **The stronger anchor
 `git diff c44720a 025b922` is empty** — merged `main`'s tree is byte-identical to the branch
 head, which ran **1499 passed, 0 failed, 49 ignored** with fmt 0, clippy 0, 49 ignored matching
 baseline and 15 contracts at status 0. Verify every SHA here with `git log -1` and
-`git ls-remote`; do not trust one written in this file. Open item 1 below now records what is
-left rather than what to do, and **what is left is real** — see its residual section.
+`git ls-remote`; do not trust one written in this file. Open item 1 below records what that
+merge left behind and what the branch after it did about it.
 
-**Item 9 is merged. Item 1's residual is the assignment — see THE ONE THING TO DO NEXT above.
-Everything else in this list is carried state, not an assignment.** Item 2c was decided on
-2026-08-18 and is now an unstarted implementation rather than an open question.
+**Item 9 is merged. Item 1's residual is implemented on `fix/daemon-reader-retryable-verdict`,
+open as PR #87 and deliberately unmerged — see the cold-start block at the top of this file,
+THE ONE THING TO DO NEXT above, and open item 1 below. Everything else in this list is carried
+state, not an assignment.** Item 2c was decided on 2026-08-18 and **remains decided but
+unbuilt**: an unstarted implementation with a specified shape, not an open question.
 
 ### WHAT IS OPEN
 
-1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). WHAT REMAINS IS
-   THE READER'S HALF, AND IT IS NOT FIXED.**
+1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). THE READER'S
+   HALF — THIS ITEM'S RESIDUAL — IS NOW COMPLETE ON `fix/daemon-reader-retryable-verdict`, OPEN
+   AS PR #87 AND STILL UNMERGED BY THE MAINTAINER'S CHOICE.**
+
+   ~~THAT HALF IS PARTIAL AND THE RESIDUE INCLUDES THE COMMON CASE.~~ **Superseded `ae03597`:
+   the common case is covered, and the residue list this item carried was itself incomplete —
+   see the last blocks of this item for what was found and what genuinely remains.**
 
    **What it was.** `write_instance_record` (`crates/gascand/src/socket.rs`) created the record
    at its final path inert — 0200, empty — wrote the content, `sync_all`-ed, then chmod-ed to
@@ -313,44 +455,197 @@ Everything else in this list is carried state, not an assignment.** Item 2c was 
    same file already did for the socket. The bounded 64-cycle form of that probe is committed as
    `no_reader_ever_sees_an_illegal_state_across_start_and_stop`.
 
-   **THE HEADLINE CORRECTION, AND DO NOT LOSE IT: THE PATH IS NOT DOWN TO THREE FACES.** A first
-   draft of the `validate_file_stat` comment claimed it was, and two independent reviewers caught
-   it. `gascan`'s own reclaim, `retire_held_record` (`crates/gascan/src/daemon.rs:1453-1455`),
-   still does `fchmod(0200)` then `ftruncate(0)` on a **published** record that
-   `validate_held_published_record` has just proven is still linked at the destination. So the
-   destination still goes 0600-with-content → **0200-with-content** → 0200-empty on the
-   `recover_stale_published_record` path — the ordinary "previous daemon was SIGKILLed, next
-   `gascan start` cleans up" path. And `inspect` (`daemon.rs:1966`) takes **no** lifecycle lock
-   while `start_with` (`:1171`) does, so a concurrent `gascan status` can still sample it.
+   **THE HEADLINE CORRECTION IS NOW ITSELF CORRECTED: THE PATH *IS* DOWN TO THREE FACES.** An
+   earlier draft of this entry said "THE PATH IS NOT DOWN TO THREE FACES", and it was true when
+   written. `gascan`'s own reclaim, `retire_held_record`, did `fchmod(0200)` then `ftruncate(0)`
+   on a **published** record that `validate_held_published_record` had just proven was still
+   linked at the destination, so the destination went 0600-with-content → **0200-with-content**
+   → 0200-empty on the ordinary "previous daemon was SIGKILLed, next `gascan start` cleans up"
+   path — and `inspect` takes **no** lifecycle lock while `start_with` does, so a concurrent
+   `gascan status` could sample it. The design change that paragraph said was needed is the
+   change that was made.
 
-   It is two syscalls wide rather than an `fsync`, and the record there has been proven dead
-   twice over, so the verdict it produces is unflattering rather than false. **That is why it was
-   not folded into the same change**: `validate_retired_tombstone` (`:1548`) requires the held
-   descriptor's inode to still be *at the name* and requires `st_nlink == 1`, and a rename
-   unlinks it — so staging-and-renaming there means rewriting that validation against the new
-   tombstone rather than the old descriptor. That is a design change to the reclaim protocol, not
-   a mechanical one.
+   **BOTH HALVES ARE FIXED AND COMPLETE ON BRANCH `fix/daemon-reader-retryable-verdict`, WHICH
+   IS OPEN AS PR #87 AND NOT MERGED — see the cold-start block at the top of this file.**
+   Base `61f1b3c`. Re-derive the commit range with
+   `git log --oneline main..fix/daemon-reader-retryable-verdict` rather than trusting a SHA
+   written here; the SHAs in this file have gone stale on their own repeatedly.
 
-   **Also true, and also not fixed: the reader has no retryable verdict.** Every disagreement
-   between two of its observations is terminal. `validate_instance_tombstone`
-   (`daemon.rs:2842-2880`) re-opens the tombstone by name and returns a terminal
-   `PermissionDenied` if a successor published in between; `open_published_record` (`:2611`)
-   reports a legitimate concurrent *stop* as `Unsafe`. Both are pre-existing and both are now
-   narrower — a rename rather than an fsync — but the shape is unchanged: **every narrow window
-   is a terminal verdict waiting for a loaded machine.**
+   **The producer half.** Retirement stages an inert file under a `.reclaim-` name, renames it
+   over the destination, and destroys the retired record's bytes only *after* the rename has
+   taken that inode out of the namespace. `validate_retired_tombstone` was rewritten against two
+   identities — the name resolves to the freshly staged inode wearing the inert face, and the
+   held inode has `st_size == 0` with `st_nlink == 0` — instead of requiring the held descriptor
+   to still be at the name. That trade lost one thing and it was restored deliberately: the old
+   post-condition proved the inode at the name was the one the recovery had validated, and the
+   replacement cannot, so `retire_held_record` compares the destination against
+   `record.identity` immediately *before* the non-`NOREPLACE` `renameat` and refuses with
+   `TombstoneChanged` if the name stopped naming its record. The two staging prefixes are now
+   shared protocol in `gascan_core::daemon_protocol` and the sweeper covers both.
+
+   **The reader half.** Race-shaped failures carry a marker (`raced` / `is_raced`) and the whole
+   observation sequence — `observe_once` — is what retries, rather than any single validator,
+   because retrying one observation against stale others manufactures fresh disagreements.
+   **Three observations total, which is two retries** — `const OBSERVATIONS: u32 = 3` driving
+   `for observation in 0..observations` in `retry_while_raced`, with `DEFAULT_POLL` between.
+   Count the observations, not the retries; the verdict's own message says "still changing after
+   3 observations". **Classification is terminal by default**: only a failure explicitly
+   constructed as raced retries, so a validator added later that nobody classifies stays
+   `Unsafe`. `(0200, content)` stays terminal on purpose — see the three-face rule in
+   `gascan_core::daemon_protocol`: the only producer left in production code is a `gascand` from
+   an older release, and nothing is going to come along and finish that record.
+
+   **The mutation results that matter, all MEASURED on 2026-08-19 at `beb05f4`, each one run by
+   hand and reverted:**
+
+   - Restoring the old two syscalls in `retire_held_record` (`fchmod` to `INSTANCE_TOMBSTONE_MODE`
+     then `ftruncate`, no staging, no rename) fails
+     `cargo test -p gascan --lib no_reader_ever_sees_an_illegal_state_across_reclaim` with
+     `a reader saw [Some((128, 341))]`. `128` is `0o200`. **`341` is that machine's number, not
+     the protocol's** — the record embeds `std::env::current_exe()`, so its serialised length
+     moves with the path of the test binary, and the same mutation run from a tree at a different
+     path reports a different second number. The test does not depend on it: it computes the legal
+     published size from `whole.len()` at run time.
+   - Hoisting the truncation above the `renameat` in `retire_held_record` fails the same test with
+     `a reader saw [Some((384, 0))]` — `0o600` at size zero, which `validate_file_stat` accepts as
+     a published record and a reader would then fail to parse. That is why the destructive step is
+     last.
+   - Widening the `ENOENT` split in `validate_instance_tombstone` to mark **every** errno raced
+     fails `a_symlink_swapped_over_the_tombstone_is_a_fault_not_a_race` with
+     `a symlink swapped over the tombstone is a fault, not a race: the daemon instance tombstone
+     was unlinked while validating it`. That test is the only thing holding the split narrow, and
+     narrowness is the whole of its safety: a symlink swapped over the name is the substitution
+     `O_NOFOLLOW` exists to refuse, and marking it raced hands the substituter a retry instead of
+     a verdict.
 
    **CI FOUND WHAT 47 MILLION LOCAL SAMPLES DID NOT — read trap 9.** The first pushed version of
-   this fix failed CI's `rust` job on `no_reader_ever_sees_an_illegal_state_across_start_and_stop`
-   with `Some((128, 9))`, and the cause was retirement chmod-ing the outgoing record before
-   truncating it: harmless in principle because the rename has already unlinked it, observable in
-   practice because `lstat` tears between resolving a name and reading the inode. Truncating
-   first fixed it, and a 4000-cycle probe then saw 0 of 87,277,118 samples.
+   the publisher fix failed CI's `rust` job on
+   `no_reader_ever_sees_an_illegal_state_across_start_and_stop` with `Some((128, 9))`, and the
+   cause was retirement chmod-ing the outgoing record before truncating it: harmless in principle
+   because the rename has already unlinked it, observable in practice because `lstat` tears
+   between resolving a name and reading the inode. Truncating first fixed it, and a 4000-cycle
+   probe then saw 0 of 87,277,118 samples.
 
-   **One window was introduced by the fix and is benign today:** `clear_inert_destination` unlinks
-   the tombstone, so `daemon.rs:2852` can now return `ENOENT` where it could not before.
-   `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)`, so `inspect_with` is
-   unaffected; only `read_attested_instance` (`:937`) propagates it, and that has no non-test
-   callers yet. **It will matter when Task 6 wires it.**
+   **The `ENOENT` that the publisher fix introduced is classified now, and it is NOT inert.**
+   `clear_inert_destination` unlinks the tombstone, so the `openat` in
+   `validate_instance_tombstone` can return `ENOENT` where it could not before. An earlier draft
+   of this entry — and the design spec — called that window reachable-but-inert in production on
+   the grounds that `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)`. **That
+   is backwards.** MEASURED on 2026-08-19 at `beb05f4` with a temporary probe, not in the tree,
+   calling `read_instance_record_for_inspection_with_hook` with a hook that unlinks the tombstone:
+   classification present → `Err(kind=PermissionDenied, raced=true)`; the `raced(...)` arm
+   reverted to `errno(error)` → `Ok(None)`. `raced()` builds a `PermissionDenied`, so the
+   `NotFound => Ok(None)` arm stops matching and stops swallowing it. The window therefore changes
+   from a silent "no record" — the reading that yields `Stopped` for a daemon that is coming up —
+   into a failure the retry looks at again. ~~No end-to-end verdict flip was tested, and none is
+   claimed.~~ **One is tested now:**
+   `every_unsafe_observation_across_a_real_stop_transition_is_marked_raced` drives whole
+   observations against a real producer and asserts every `Unsafe` carries a marker.
+
+   **THE READER HALF IS COMPLETE. THE BLOCKS THAT STOOD HERE — `KNOWINGLY LEFT`, `ALSO LEFT`
+   AND `FIVE MINORS` — ARE ALL DISCHARGED.**
+
+   ~~Complete as of `ae03597`.~~ **It was not, and the way it was wrong is the most useful thing
+   in this entry.** `ae03597` claimed completeness on the strength of a loop test that drove
+   `read_instance_record_for_inspection` — but a production observation does more than read the
+   record: a read that *succeeds* is followed by `open_published_record`, whose own `openat` was
+   unclassified. A review MEASURED it at `8613f22` by driving `observe_once_with_hook` instead,
+   20,000 observations against a publish-and-retire producer: **4456 terminal `Unsafe` verdicts,
+   100% of them from that one `openat`, about 55% of all `Unsafe` observations.** A `gascan
+   status` crossing an ordinary stop still reported a healthy daemon as unsafe, on the production
+   path, after a commit that said the case was covered.
+
+   **The lesson is not "one more site". It is that a test one layer below the production path
+   proves nothing about the production path** — the second time this exact mistake was made on
+   this branch (the first is recorded under
+   `every_tombstone_failure_across_a_concurrent_unlink_is_marked_raced`, where a reader placed
+   above `read_instance_record_for_inspection`'s `NotFound => Ok(None)` arm could not see the very
+   errors it was testing, and a whole classification could be deleted with the mutation caught
+   0/3). `every_unsafe_observation_across_a_real_stop_transition_is_marked_raced` now drives the
+   whole observation and is the test that should have been written first.
+
+   **The design problem was real and the answer was a parameter, not a sweep.**
+   `validate_file_stat` could not be reclassified in place because it guards two different files
+   through two generic helpers. It now takes `GuardedFile` (`LifecycleLock` | `InstanceRecord`),
+   threaded through `validate_open_file` and `file_identity_at`, and its faults are values rather
+   than message strings so that the terminal/retryable decision is made once, in
+   `StatFault::is_transitional_for`, against the file being guarded. A call site added later
+   cannot inherit a classification by accident — it will not compile until it states one.
+
+   **The widening is exactly two faults on exactly one file:** `Unlinked` (`st_nlink == 0`) and
+   `InertTombstone` (0200 and empty), for `InstanceRecord` only. Everything else stays terminal
+   everywhere, and the one to defend is **`UnpublishedRecord` — 0200 with content**. Per the
+   three-face rule nothing will finish that record, so retrying it would report a permanently
+   stuck record as a passing squall. `ExtraLinks` is excluded on purpose: a second name for the
+   file is someone else's doing, not the daemon's.
+
+   **The residue list this file used to carry was incomplete, and the omission was the biggest
+   item on it.** MEASURED at `bf107a1` with a temporary probe not in the tree, five seconds of a
+   publish-and-retire loop: 2426 `link count is not one (mode 0600, links 0)`, 1138 `mode is 0200
+   and the file is empty`, 11 bare `EACCES`. The `nlink == 0` tear was never enumerated here. The
+   three identity-comparison messages the old list *did* name produced **zero** samples in that
+   window: `validate_file_stat` reaches a verdict first on every path the stop transition takes.
+   They are classified now regardless, driven by their own tests.
+
+   **`EACCES` is classified by evidence, not by declaration**, because no validator sees it —
+   the record read's `O_RDONLY` `openat` is refused by the kernel first.
+   `classify_unreadable_instance_record` looks at the name again and marks it raced only if it
+   now holds an inert tombstone or has gone. A record chmod-ed to 0200 and *left* there still
+   reaches the caller as `Unsafe`, which is the tampering shape and the reason the split is
+   narrow.
+
+   **One classification changes what a caller sees, not just how it is labelled.**
+   `file_identity_at`'s `ENOENT` was `NotFound`, and `read_instance_record_for_inspection` maps
+   `NotFound` to `Ok(None)` — so that window used to read out as a confident "stopped" for a
+   daemon mid-transition. `raced()` builds a `PermissionDenied`, which that arm no longer
+   swallows. This is also why a test above that mapping cannot see this class of bug: MEASURED,
+   with the reader on the inspection wrapper, removing the `openat` `ENOENT` split entirely was
+   caught **0 times in 3 runs**.
+
+   **The retry composition is sealed, which is the fifth minor.** `observe::sealed` holds
+   `inspect_with_hook`, `retry_while_raced` and `observe_once_with_hook`; only the first leaves
+   the module. Rewriting `inspect_with`'s delegation to call the observation directly is now a
+   compile error — VERIFIED, `cargo build -p gascan` fails with E0425. The review's premise was
+   off by one: that function has **two** legitimate callers, `inspect_with` and
+   `ensure_started_locked_with_hook`'s readiness loop.
+
+   **The other four minors are fixed. Three are held by a test that fails when the fix is
+   reverted; the fourth is not, and an earlier draft of this entry claimed all four were —
+   corrected after a review MEASURED the difference.** `inspect_with_hook` takes the retry delay
+   as a parameter so `SupervisorTimeouts::poll` reaches it (MEASURED before the test existed:
+   putting `DEFAULT_POLL` back passed all 320 tests — nothing held it, and
+   `the_retry_waits_the_caller_s_poll_rather_than_the_constant` does now); the give-up verdict's
+   marker composes the terminal endpoint fault with the race instead of dropping the actionable
+   half; and the module seal is enforced by the compiler. **`stage_inert_reclaim_file`'s
+   staging-name check is the one with no test** — deleting the `raw_identity_at` comparison leaves
+   `cargo test -p gascan --lib` green, MEASURED — and it is listed as uncovered below, which is
+   where it belongs.
+
+   **The seal is a build property, not a test property.** The `#[cfg(test)]` re-export makes the
+   bypass nameable under the test harness, so `cargo test` alone stays green on it; CI catches it
+   because `cargo clippy --workspace --all-targets` compiles the lib target without `cfg(test)`.
+   Recorded in the `observe` module's own doc comment too.
+
+   **WHAT IS STILL NOT COVERED BY A DRIVING TEST, and it is five defensive branches, all
+   recorded rather than missed:**
+
+   - `empty_unlinked_inode`'s `st_nlink != 0` refusal, and `validate_retired_tombstone`'s "staged
+     tombstone changed while being renamed into place" check — the two the first review listed.
+   - `stage_inert_reclaim_file`'s staging-name comparison, and **the cleanup guard beside it**.
+     The second review MEASURED both directions of that guard: deleting it, and inverting it so it
+     unlinks precisely a stranger's file, each left `cargo test -p gascan --lib` at 324 passed.
+   - `open_published_record`'s recheck-`statat` `ENOENT` split.
+
+   All five are unreachable by construction on every path traceable in the tree. If any is ever
+   reported in the field it will be the first time it has run.
+
+   **How the coverage is actually held, because the shape matters for anyone extending it.**
+   Three loop tests drive real producers and assert that *every* failure the reader produces is
+   marked; four hook- or fixture-driven tests pin the windows the loops structurally cannot reach.
+   That split is not stylistic — MEASURED at 4096 cycles, the stop-transition loop catches a
+   reverted `Unlinked` or `InertTombstone` classification 3/3, but catches the record read's two
+   identity comparisons only 1/3 and 0/3, because a published→published transition is not
+   something that loop produces. Raising the cycle count does not fix that and was tried.
 
 2. **(2c) THE DAEMON'S PRODUCTION LOG IS DECIDED AND UNBUILT. DO NOT RE-OPEN THE DECISION.**
    The maintainer ruled on 2026-08-18: **daemon-level events only, redacted.** Start, stop and
@@ -2689,6 +2984,24 @@ backpressure_timeout` (twice, missing a hard 2s wall-clock bound by 100ms and by
 `concurrent_clients_converge_on_one_private_daemon` (D7, above), and
 `same_image_apply_recreates_explicit_ssh_as_automatic`.
 
+**A SHARPER STATEMENT OF THE SAME WANDER, MEASURED ON ONE BRANCH: three consecutive completed
+`rust` runs, two different failing tests, and a green run between them.** On
+`fix/daemon-reader-retryable-verdict`, read from `gh run list --workflow=ci.yml --branch
+fix/daemon-reader-retryable-verdict` and `gh run view <id> --json jobs`:
+
+| run | head | `rust` |
+|---|---|---|
+| `32266053978` | `a902fd5` | red — `provision_and_health_kill_point_phase_matrix_has_exact_recovery_status` |
+| `32276791896` | `d5ea334` | **green** |
+| `32281948905` | `b1ef129` | red — `automatic_ssh_port_reservation_is_loopback_unprivileged_and_exclusive` |
+
+(A fourth run, `32276374732` at `56b343c`, was cancelled before `rust` concluded and is not
+counted.) **The last of those failed on a commit that changed no code at all** —
+`git diff --name-only d5ea334 b1ef129` returns `docs/status/START-HERE.md` and nothing else — so
+the identical code passed and then failed in consecutive runs. Two mechanisms, one branch, one
+day. **With six mechanisms and a wander this wide, a single red `rust` job is not evidence about
+a branch.**
+
 **One failure mode reproduced verbatim across branches, five days apart**, which is the
 proof it is not a given branch's doing: `main`'s `31203816056` and PR #69's third attempt
 both died as `KeygenRejected(KeygenRejection { outcome: Code(255), message:
@@ -2698,12 +3011,205 @@ both ending `error: test failed, to rerun pass \`-p gascand --test apply_setup\`
 **How to decide whether a red `rust` is yours.** Do not argue from probability — check the
 diff. `git diff <merge-base>..HEAD -- crates/<the failing crate>/` empty means your branch
 cannot have caused it, and that is a proof rather than an estimate. It was empty for
-`crates/gascan-e2e/` throughout P5.1.
+`crates/gascan-e2e/` throughout P5.1. **Exonerate by diff PLUS isolation, never by probability —
+but check first whether the failing commit changed any code at all**, with
+`git diff --name-only <the last commit CI ran> <head>`. When it did not, the question is
+settled without scoping a diff to a crate and without running anything in isolation, and on this
+branch that has been the cheapest exoneration available and also the strongest.
 
 **The standing rule: a green local `cargo test --workspace` is the bar. CI reports but
 must not gate, and flake-chasing waits** until someone is asked to do it. There are at
-least three distinct root causes to fix when that day comes — the PTY wall-clock bound,
-D7's `0200` window, and the keygen `/dev/fd` descriptor.
+least six distinct root causes to fix when that day comes — the PTY wall-clock bound,
+D7's `0200` window, the keygen `/dev/fd` descriptor, the empty pid file below, the
+reconcile phase matrix below that, and the `lifecycle` ephemeral-port collision after it.
+
+**THE FOURTH MECHANISM, FOUND 2026-08-19 AND NOT FIXED: the e2e harness reads the pid file
+while it is empty.** `doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` failed
+a local `cargo test --workspace` on `fix/daemon-reader-retryable-verdict` with `Error:
+ParseIntError { kind: Empty }`. The mechanism is three lines, all read from the tree:
+`crates/gascand/src/api.rs:504` writes the pid with `std::fs::write(pid_path,
+std::process::id().to_string())?`, a create-truncate followed by a write;
+`wait_for_socket` at `crates/gascan-e2e/tests/doctor.rs:263` gates readiness on
+`pid.exists()` alone; and `UpgradeEnvironment::pid` at
+`crates/gascan-e2e/tests/doctor.rs:346-349` does `read_to_string(...).trim().parse()`. A read
+that lands between the create and the write sees a file that exists and is empty, which is
+that error exactly. A fixture-startup race in the e2e harness, widened by load — **NOT
+mechanism 1**, the `ssh-keygen` `/dev/fd` descriptor flake, which fails with `Bad file
+descriptor` out of `gascand`'s `apply_setup`.
+
+Exonerated by diff and by isolation: `fix/daemon-reader-retryable-verdict` touches no file
+under `crates/gascan-e2e/`, and `cargo test -p gascan-e2e --test doctor
+doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` passed **4 runs out of 4**.
+**Candidate cure, not built:** gate on the pid file being non-empty, or have the daemon write
+it via a staged rename — the discipline the instance record gained in `025b922`, applied to a
+file the tests depend on.
+
+**THE FIFTH MECHANISM, FOUND 2026-08-19 AND NOT DIAGNOSED: `main` is red on the reconcile
+phase matrix, and it is not a branch's doing.** The `rust` job fails with
+`provision_and_health_kill_point_phase_matrix_has_exact_recovery_status` panicking at
+`crates/gascand/tests/reconcile.rs:965:9`, `assertion left == right failed: during-health,
+left: Completed, right: Failed`. That is CI run `32266053978` on
+`fix/daemon-reader-retryable-verdict` at `a902fd5` — and it is **not that branch's**: run
+`32214820420` is on `main` at `61f1b3c`, which is that branch's own merge-base
+(`git merge-base main fix/daemon-reader-retryable-verdict` → `61f1b3c64b10dec`), and it
+failed on the same test at the same line with the same two values, `27 passed; 1 failed`.
+So `main` itself is red for this reason, independent of any branch.
+
+Exonerated by diff and by isolation: `git diff --stat 61f1b3c...fix/daemon-reader-retryable-verdict
+-- crates/gascand/tests/reconcile.rs` is empty, and locally on
+`fix/daemon-reader-retryable-verdict`
+`cargo test -p gascand --test reconcile
+provision_and_health_kill_point_phase_matrix_has_exact_recovery_status` passed **12 runs
+out of 12** and the full `cargo test -p gascand --test reconcile` passed **3 runs out of 3**
+(28 passed, 0 failed each time). **The mechanism is not known.** `Completed` where `Failed`
+is expected means a kill during the health phase left an operation looking successful, which
+is a description of the assertion and not a diagnosis; nobody has traced it. Do not repeat a
+guess about it as a finding.
+
+**It recurred on 2026-08-19 in run `32315397045`, at `cfcfb62` on PR #87, with the same test,
+the same line and the same two values — and that commit changes no code at all.**
+`git diff --name-only 93c77fe cfcfb62` returns `docs/status/START-HERE.md`, one Markdown file,
+and the immediately preceding head `93c77fe` had just settled `rust` SUCCESS on a re-run. That
+is the same cheapest-and-strongest exoneration the sixth mechanism's entry describes, and it is
+now the second time this file has been able to use it. **Two of the seven mechanisms have now
+been caught failing on Markdown-only commits**, which is worth knowing before anyone spends a
+session bisecting one of them against code.
+
+**THE SIXTH MECHANISM, FOUND 2026-08-19 AND NOT DIAGNOSED: an ephemeral-port collision in
+`gascand`'s `lifecycle` suite.** The `rust` job of run `32281948905`, on PR #87, failed with:
+
+```
+---- automatic_ssh_port_reservation_is_loopback_unprivileged_and_exclusive stdout ----
+Error: Os { code: 48, kind: AddrInUse, message: "Address already in use" }
+test result: FAILED. 78 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.91s
+error: test failed, to rerun pass `-p gascand --test lifecycle`
+```
+
+The test is `crates/gascand/tests/lifecycle.rs:342`. An ephemeral-port collision on a shared
+runner is as far as this goes. **It is not diagnosed. Do not write a guess about which port,
+which peer, or which reservation window as if it were a finding** — that is the error the fifth
+mechanism's entry warns about, one heading up.
+
+**Its exoneration is the cheapest in this file and also the strongest, because the commit it
+failed on changes no code at all.** The run's head is `b1ef129`, and
+`git diff --name-only d5ea334 b1ef129` returns `docs/status/START-HERE.md` — one Markdown file,
+nothing more. The immediately preceding run, `32276791896` on `d5ea334`, passed `rust`
+(`gh run view 32276791896 --json jobs`). So this is not an inference from an empty crate-scoped
+diff and not one from isolation: **the code under test was byte-identical to code CI had just
+run green.** When that is available it beats every other form of exoneration, and it costs one
+`git diff --name-only`.
+
+**THE SEVENTH MECHANISM, FOUND 2026-08-19 AND NOT DIAGNOSED: a `ContainerState` still `Running`
+in `gascand`'s `lifecycle` suite.** The `rust` job of run `32314592435`, on PR #87 at `93c77fe`,
+failed with:
+
+```
+---- retained_ssh_host_key_failure_removes_prior_alias_before_stop stdout ----
+thread '...' panicked at crates/gascand/tests/lifecycle.rs:1228:5:
+assertion `left == right` failed
+  left: Running
+ right: Stopped
+test result: FAILED. 78 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.08s
+error: test failed, to rerun pass `-p gascand --test lifecycle`
+```
+
+The test asserts that a failed `up` — rejected for `ssh_host_key_mismatch` — has left the
+container `Stopped`, and it sampled `Running`. **It is not diagnosed.** Whether the failure path
+returns before the stop completes, or the `FakeRuntime` publishes its state non-atomically, is
+exactly the kind of guess the fifth mechanism's entry warns against writing down. Note it is a
+*different* test from the sixth mechanism's in the same target, so "the `lifecycle` flake" is
+already at least two distinct mechanisms and should not be spoken of as one.
+
+**Exonerated by diff AND isolation, and the diff half is unusually clean here.**
+`crates/gascand/Cargo.toml`'s `[dev-dependencies]` does not list `gascan`, so the crate that
+commit changed is **not linked into this test binary at all**; and the assertion is on
+`ContainerState` from a `FakeRuntime`, not on `DaemonState`, so it shares no code with the
+reader classification. `git diff --name-only 8613f22 93c77fe` returns only
+`crates/gascan/src/daemon.rs` and `docs/status/START-HERE.md`. Isolation: the test was run six
+consecutive times locally with `cargo test -p gascand --test lifecycle
+retained_ssh_host_key_failure_removes_prior_alias_before_stop`, 1 passed 0 failed each time, and
+the full `cargo test --workspace` at that commit reported 85 suites, 1534 passed, 0 failed.
+
+**THE EIGHTH MECHANISM, FOUND 2026-08-19: a wall-clock bound in `gascan-e2e`'s PTY signal
+test.** The `rust` job of run on PR #87 at `ec47492` failed with:
+
+```
+---- apple_common::tests::pty_signal_driver_does_not_wait_for_inherited_slave_descriptor stdout ----
+panicked at crates/gascan-e2e/tests/apple_common/mod.rs:4562:9:
+signal helper waited 420.525083ms for an inherited PTY slave descriptor
+test result: FAILED. 75 passed; 1 failed; 8 ignored; 0 measured; 0 filtered out; finished in 8.12s
+```
+
+**Unlike the other seven, this one's shape is visible in the source rather than guessed.** The
+assertion at `crates/gascan-e2e/tests/apple_common/mod.rs:4562` is
+`started.elapsed() < std::time::Duration::from_millis(250)` — a bound on wall-clock time. It
+measured 420ms. That the bound is wall-clock is a fact about the code; **why the machine took
+420ms is not diagnosed and must not be written down as though it were.**
+
+What this does license, and it is the only mechanism here that licenses anything: a test whose
+pass condition is "the machine was fast enough" will fail on a shared runner eventually,
+whatever the code does. Whoever takes the flake work should decide whether that assertion wants
+a larger bound, a different instrument, or to be `#[ignore]`d in CI — that is a design call, not
+a diagnosis, and it is the one place in this list where the fix does not require finding a race
+first.
+
+Exonerated by diff: `git diff --name-only cfcfb62 ec47492` returns `docs/status/START-HERE.md`
+and nothing else.
+
+**THE PATTERN ACROSS THE LAST THREE RUNS ON THIS BRANCH IS WORTH MORE THAN ANY ONE OF THEM.**
+At `93c77fe`, `cfcfb62` and `ec47492` the `rust` job failed on **three different tests in three
+different crates** — `gascand`'s `lifecycle`, `gascand`'s `reconcile`, and `gascan-e2e`'s
+`apple_common` — and **the last two commits contain no code at all**. A green `rust` on this
+branch is currently the exception. Do not read a red `rust` here as evidence about a branch until
+`git diff --name-only` has been run against the failing commit.
+
+~~and the local `cargo test --workspace` is the signal that means anything.~~ **Corrected the same
+day, and this correction matters more than the sentence it replaces: the local suite flakes at
+roughly the same rate CI does.** `cargo test -p gascan --lib` failed 12 times in 43 runs — see
+`THE NINTH MECHANISM` below. A single green local run is a data point, not a gate, and any durable
+claim of the form "N passed each of M runs" needs the load conditions attached, because mine did
+not reproduce and the machine turned out to be carrying four leaked CPU burners at the time.
+
+**THE NINTH MECHANISM, FOUND 2026-08-19: `cargo test -p gascan --lib` fails about a third of the
+time on this machine, across four distinct tests.** This is the entry that should change how
+anyone reads the other eight, because `gascan --lib` is the suite this file had been treating as
+the trustworthy local signal.
+
+MEASURED on 2026-08-19, running exactly `cargo test -p gascan --lib` and nothing beside it:
+
+| run set | conditions | failures |
+|---|---|---|
+| 8 runs | four spinning `yes` processes present (see below) | 2 |
+| 20 runs | same, with fixture step-attribution compiled in | 4 |
+| 15 runs | quiet machine | **6** |
+
+**43 runs, 12 failures — about 28% overall, and 40% in the unloaded set.** The four tests are
+`inherited_startup_diagnostic_survives_path_replacement` (7 of the 12, the dominant one),
+`start_readiness_waits_for_its_own_connected_publication_to_finish`,
+`tombstone_recovery_retires_held_residue_after_bounded_endpoint_reinspection`, and one
+unattributed sighting described below. **None is reproducible in isolation**: the one test that
+was tried alone ran 25 times with 0 failures. An independent review measured the same shape
+separately, including **1 failure in 6 at the parent commit `8613f22`**, so none of this is a
+regression from the reader work.
+
+**Read the conditions column, because the first two sets were measured under load I did not know
+was there.** A review subagent left four `yes` processes spinning; they were found at 68 minutes
+of CPU each and killed by PID. The naive expectation is that this inflated the failure rate. **It
+did not** — the quiet-machine set is the *worst* of the three, 6 in 15. The load was a confound in
+the honest sense that the numbers could not be interpreted until it was removed, not in the sense
+that it explains the flakes away.
+
+**One of the twelve is unattributed and stays that way.**
+`every_reader_failure_across_a_real_stop_transition_is_marked_raced` failed once with a bare
+`Os { code: 2, kind: NotFound }` out of the `commit_at_instance` fixture. It did not reproduce in
+25 isolated runs, nor in 20 full-suite runs with per-step attribution temporarily compiled in.
+The three step messages were **kept** in `commit_at_instance` so a second sighting names its own
+syscall. Do not write down a cause for it; nobody has one.
+
+`start_readiness_waits_for_its_own_connected_publication_to_finish` is the one with a visible
+shape, same class as the eighth: it gives `start_with` `readiness: 200ms` with `poll: 1ms`, so a
+loaded machine misses the budget. Like the eighth, its fix is a design call rather than a race
+hunt.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.

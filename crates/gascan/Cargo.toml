@@ -34,3 +34,6 @@ workspace = true
 sha2.workspace = true
 rustix-openpty = "0.2"
 tempfile = "3"
+# `test-util` for `#[tokio::test(start_paused = true)]`: a deadline-driven loop
+# that a test has to watch iterate is otherwise a wall-clock race.
+tokio = { workspace = true, features = ["test-util"] }

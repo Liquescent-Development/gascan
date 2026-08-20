@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use gascan_core::daemon_protocol::{
-    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_TOMBSTONE_MODE, LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE,
-    SOCKET_NAME,
+    DIRECTORY_MODE, INSTANCE_NAME, INSTANCE_STAGING_PURPOSE, INSTANCE_TOMBSTONE_MODE,
+    LIFECYCLE_LOCK_NAME, PRIVATE_FILE_MODE, RECLAIM_STAGING_PURPOSE, SOCKET_NAME,
 };
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -26,10 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const _: () = assert!(DIRECTORY_MODE as u32 == gascan_proto::SOCKET_DIRECTORY_MODE);
 const _: () = assert!(PRIVATE_FILE_MODE as u32 == gascan_proto::SOCKET_MODE);
 
-/// The staging prefix the sweeper matches. This one is `gascand`'s alone: no
-/// reader ever sees a staged file by name, so it is not part of the shared
-/// protocol and must not join it.
-const INSTANCE_STAGING_PURPOSE: &str = "instance";
 static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,11 +281,41 @@ where
         // create at the name -- its commit is `NOREPLACE` and ours occupies the
         // name -- and it cannot reach that commit at all, because
         // `clear_inert_destination` refuses anything that is not 0200-and-empty
-        // and ours is 0600-with-content. `gascan` never creates or renames a
-        // node at this path; its reclaim only edits a descriptor it already
-        // holds. And two live daemons are excluded upstream anyway, by
-        // `prepare_socket` refusing `AddrInUse` against a live socket before
-        // either one reaches this file.
+        // and ours is 0600-with-content.
+        //
+        // ~~`gascan` never creates or renames a node at this path; its reclaim
+        // only edits a descriptor it already holds.~~ **Corrected: both halves
+        // stopped being true.** `retire_held_record` in
+        // `crates/gascan/src/daemon.rs` stages a `.reclaim-` file in this
+        // directory and renames it over this name, for the same reason this
+        // function does -- chmod-then-truncate on a live record is the illegal
+        // fourth face, wherever it is written. So the CLI is a second writer of
+        // this name and that leg is gone.
+        //
+        // What replaces it does not argue the interleaving impossible; it
+        // argues it harmless. Both writers commit an inert 0200-and-empty
+        // tombstone, so whichever rename lands second, the destination a reader
+        // samples is a legal tombstone and never the fourth face. Neither
+        // writer touches the destination after its own rename -- each only
+        // edits the descriptor it already holds. And the CLI does the same
+        // check-then-act this comment defends, comparing the name against the
+        // inode its recovery validated on the line above its rename: if this
+        // function's tombstone reaches the name first, the CLI refuses instead
+        // of overwriting it; if the CLI's reaches the name before the
+        // `identity_at` check above, that check fails and this function does
+        // not rename at all; and in the one remaining order -- the CLI's
+        // landing inside this very window -- this rename replaces one inert
+        // tombstone with another. The CLI notices it lost, because it compares
+        // the name against the inode it staged afterwards and reports
+        // `TombstoneChanged`; this function does not check, which costs nothing
+        // because the name holds a legal tombstone in every ordering.
+        //
+        // Most of this is fenced anyway by the lifecycle lock the CLI holds
+        // across the whole of its recovery; `sweep_abandoned_staging` below
+        // names the `gascand`s that fence does not cover, and the argument
+        // above is what covers them. And two live daemons are excluded upstream
+        // anyway, by `prepare_socket` refusing `AddrInUse` against a live
+        // socket before either one reaches this file.
         rustix::fs::renameat(directory, staging.as_str(), directory, name).map_err(errno)?;
         guard.disarm();
         drop(guard);
@@ -477,14 +503,52 @@ where
 /// on the next lifecycle command. The rename is what created this, so the sweep
 /// belongs with the rename.
 ///
-/// Only this crate's own instance staging is swept, by prefix, and only regular
-/// files this user owns. A live daemon's staging cannot be caught: publication
-/// runs once per daemon and `prepare_socket` has already refused to start a
-/// second one against a live socket. Failure to sweep is not failure to
-/// publish -- there is nothing a caller could do about a stale file it does not
-/// own -- so this returns nothing.
+/// Only staging is swept, by prefix, and only regular files this user owns.
+/// Two processes stage here now, so the old argument -- that publication runs
+/// once per daemon and `prepare_socket` has already refused a second one -- no
+/// longer covers the set.
+///
+/// What the lifecycle lock fences is this. In `crates/gascan/src/daemon.rs`,
+/// the CLI stages only inside `retire_held_record`, which is reached only from
+/// `recover_interrupted_tombstone` and `recover_stale_published_record`, and
+/// those only from `ensure_started_locked`. That function has three callers --
+/// `start_with`, `restart_with`, and
+/// `connect_current_or_recover_with_observer`, the auto-start path an ordinary
+/// data command takes -- and each one takes the lifecycle lock before the call
+/// and holds it across the whole of it. On the success path the spawning call
+/// still holds that lock when the daemon it spawned publishes, so a CLI's
+/// staging and this sweep cannot interleave.
+///
+/// The fence does not cover every `gascand`, and the residue is named here
+/// rather than argued away. `ensure_started_locked` spawns detached and then
+/// waits: on a readiness deadline it returns `SupervisorError::Readiness` and
+/// its caller's lock drops while the spawned daemon may still be coming up, so
+/// that daemon publishes and sweeps with no lock held by anyone. A `gascand`
+/// need not have been CLI-spawned at all -- `write_daemon_instance_record`
+/// mints its own token when the environment supplies none
+/// (`crates/gascand/src/api.rs`) -- so a hand-launched or service-managed
+/// daemon sweeps outside the lock entirely. Either sweep can reach a
+/// `.reclaim-` file a CLI is staging under the lock at that moment.
+///
+/// Nothing leaks when that happens: the reclaim staging file is empty from
+/// birth and carries no token, unlike this crate's own staging, which holds a
+/// complete record and is why the sweeper exists at all. The cost is not
+/// nothing, though, and it does not stay in this crate. The CLI's rename fails
+/// `ENOENT` and takes the lifecycle command with it, so a `gascan start` dies
+/// because a `gascand` swept a file that command was holding open.
+/// `retire_held_record` in `crates/gascan/src/daemon.rs` maps that one errno to
+/// `SupervisorError::TombstoneChanged` and names this sweep in the detail, so
+/// the failure is attributable. It is not prevented: an age or liveness floor
+/// on what counts as abandoned would close the window, and this sweeper has
+/// neither.
+///
+/// Failure to sweep is not failure to publish -- there is nothing a caller
+/// could do about a stale file it does not own -- so this returns nothing.
 fn sweep_abandoned_staging(directory: &OwnedFd) {
-    let prefix = format!(".{INSTANCE_STAGING_PURPOSE}-");
+    let prefixes = [
+        format!(".{INSTANCE_STAGING_PURPOSE}-"),
+        format!(".{RECLAIM_STAGING_PURPOSE}-"),
+    ];
     let Ok(path) = resolved_path(directory, ".") else {
         return;
     };
@@ -496,7 +560,10 @@ fn sweep_abandoned_staging(directory: &OwnedFd) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !name.starts_with(prefix.as_str()) {
+        if !prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_str()))
+        {
             continue;
         }
         let Ok(stat) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
@@ -1219,6 +1286,40 @@ mod tests {
         assert_eq!(fs::read(&bystander)?, b"not ours to remove");
         assert!(directory.is_dir());
         assert_eq!(fs::read(&path)?, b"second");
+        drop(record);
+        Ok(())
+    }
+
+    /// The CLI stages an inert tombstone in this directory when it retires a record
+    /// it has proven dead, so a CLI killed between staging and renaming leaves a
+    /// file behind under a prefix nothing else enumerates. It holds no token -- it
+    /// is empty from birth -- so this is tidiness rather than secrecy, but the
+    /// sweeper is the only thing that enumerates this directory and it has to cover
+    /// both stagers or one of them accumulates a file per crash forever.
+    #[test]
+    fn publication_sweeps_abandoned_reclaim_staging_too() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let path = root.join("daemon-instance.json");
+        drop(super::write_instance_record(&path, b"first")?);
+
+        let abandoned = root.join(format!(".{}-BBBBBBBBBB", super::RECLAIM_STAGING_PURPOSE));
+        fs::write(&abandoned, b"")?;
+        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o200))?;
+        let bystander = root.join(".bystander");
+        fs::write(&bystander, b"not ours to remove")?;
+
+        let record = super::write_instance_record(&path, b"second")?;
+
+        assert!(
+            !abandoned.exists(),
+            "the abandoned reclaim staging survived the sweep"
+        );
+        assert!(
+            bystander.exists(),
+            "the sweep removed a file that was not staging"
+        );
         drop(record);
         Ok(())
     }
