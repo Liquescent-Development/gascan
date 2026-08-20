@@ -146,39 +146,6 @@ async fn persistent_logs_are_isolated_by_exact_sandbox_id() {
     );
 }
 
-pub async fn backend_contract(backend: &dyn RuntimeBackend) {
-    let fixture = create_request("contract");
-    let id = fixture.id().clone();
-    assert_eq!(backend.inspect(&id).await.unwrap(), None);
-    let created = backend.create(fixture.request()).await.unwrap();
-    assert!(
-        created
-            .created()
-            .iter()
-            .any(|resource| resource.kind() == ResourceKind::Container)
-    );
-    assert_eq!(
-        backend.inspect(&id).await.unwrap().unwrap().state,
-        gascan_core::runtime::ContainerState::Stopped
-    );
-    backend.start(&id).await.unwrap();
-    let mut session = backend
-        .exec(ExecRequest::fixture(id.clone(), ["true"]))
-        .await
-        .unwrap();
-    session.send(ExecInput::Close).await.unwrap();
-    assert_eq!(
-        session.next().await.unwrap().unwrap(),
-        ExecOutput::Exit { code: 0, signal: 0 }
-    );
-    backend.stop(&id).await.unwrap();
-    backend
-        .remove(RemoveRequest::from_resources(created.created().to_vec()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(backend.inspect(&id).await.unwrap(), None);
-}
-
 #[tokio::test]
 async fn inventory_reports_owned_foreign_and_mismatched_resources() {
     let backend = FakeRuntime::new(capabilities());
@@ -648,12 +615,6 @@ async fn injected_post_mutation_create_failure_reports_partial_resources() {
 
     assert_eq!(failure.code(), "injected_failure");
     assert_eq!(failure.created().len(), 2);
-}
-
-#[tokio::test]
-async fn fake_runtime_satisfies_backend_contract_through_trait_object() {
-    let backend: Box<dyn RuntimeBackend> = Box::new(FakeRuntime::new(capabilities()));
-    backend_contract(backend.as_ref()).await;
 }
 
 #[test]

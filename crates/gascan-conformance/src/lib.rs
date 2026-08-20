@@ -7,7 +7,10 @@
 use camino::Utf8Path;
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
-use gascan_core::runtime::{CreateRequest, NetworkIsolation, RuntimeCapabilities, RuntimeVersion};
+use gascan_core::runtime::{
+    ContainerState, CreateRequest, ExecInput, ExecOutput, ExecRequest, NetworkIsolation,
+    RemoveRequest, ResourceKind, RuntimeBackend, RuntimeCapabilities, RuntimeVersion,
+};
 use gascan_core::sandbox::SandboxSpec;
 use std::ops::Deref;
 
@@ -82,10 +85,6 @@ pub fn capabilities() -> RuntimeCapabilities {
         offline: NetworkIsolation::Proven,
     }
 }
-
-use gascan_core::runtime::{
-    ContainerState, ExecInput, ExecOutput, ExecRequest, RemoveRequest, ResourceKind, RuntimeBackend,
-};
 
 /// The contract every `RuntimeBackend` owes, whatever it is implemented over.
 ///
