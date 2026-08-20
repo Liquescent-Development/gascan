@@ -82,3 +82,44 @@ pub fn capabilities() -> RuntimeCapabilities {
         offline: NetworkIsolation::Proven,
     }
 }
+
+use gascan_core::runtime::{
+    ContainerState, ExecInput, ExecOutput, ExecRequest, RemoveRequest, ResourceKind, RuntimeBackend,
+};
+
+/// The contract every `RuntimeBackend` owes, whatever it is implemented over.
+///
+/// `fixture` is a parameter and not built here because `PolicyCompiler::compile`
+/// pins the approved workspace image, which a live engine's seeded store does
+/// not hold -- see `CreateRequestFixture::for_image`.
+pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequestFixture) {
+    let id = fixture.id().clone();
+    assert_eq!(backend.inspect(&id).await.unwrap(), None);
+    let created = backend.create(fixture.request()).await.unwrap();
+    assert!(
+        created
+            .created()
+            .iter()
+            .any(|resource| resource.kind() == ResourceKind::Container)
+    );
+    assert_eq!(
+        backend.inspect(&id).await.unwrap().unwrap().state,
+        ContainerState::Stopped
+    );
+    backend.start(&id).await.unwrap();
+    let mut session = backend
+        .exec(ExecRequest::fixture(id.clone(), ["true"]))
+        .await
+        .unwrap();
+    session.send(ExecInput::Close).await.unwrap();
+    assert_eq!(
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Exit { code: 0, signal: 0 }
+    );
+    backend.stop(&id).await.unwrap();
+    backend
+        .remove(RemoveRequest::from_resources(created.created().to_vec()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(backend.inspect(&id).await.unwrap(), None);
+}
