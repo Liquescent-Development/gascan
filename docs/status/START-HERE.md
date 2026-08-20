@@ -16,14 +16,27 @@ ninth is about the *local* suite, so read it before trusting a green local run.
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**PR #87 IS OPEN AND THE READER HALF IS NOW COMPLETE ON IT. IT IS STILL NOT MERGED — that is
-the maintainer's call, not a leftover.** Branch `fix/daemon-reader-retryable-verdict` carries
-open item 1 entire, producer and reader. At the time of writing it is **25 commits off `main` at
-merge-base `61f1b3c`** (`git rev-list --count main..fix/daemon-reader-retryable-verdict` → 25;
+**PR #87 IS OPEN, THE READER HALF IS COMPLETE, TWO REVIEW ROUNDS ARE DISCHARGED, AND CI IS
+GREEN. IT IS NOT MERGED — that is the maintainer's call and the only thing left on it.** Branch
+`fix/daemon-reader-retryable-verdict` carries open item 1 entire, producer and reader. At the
+time of writing it is **31 commits off `main` at merge-base `61f1b3c`**
+(`git rev-list --count main..fix/daemon-reader-retryable-verdict` → 31 as of head `2a622f0`,
+and the commit carrying this sentence makes it 32 — which is the staleness this file keeps
+warning about, arriving inside the warning again;
 `git merge-base main fix/daemon-reader-retryable-verdict` →
-`61f1b3c64b10decbd6548543d9e6bfccbcdac048`), head `ae03597`. **Re-derive every one of those with
-`gh pr view 87`, `gh pr checks 87`, `git log -1` and `git status`** — the SHAs and branch states
-written in this file have gone stale repeatedly, sometimes within hours.
+`61f1b3c64b10decbd6548543d9e6bfccbcdac048`), head `2a622f0`, and at that head `gh pr checks 87`
+reported `gate`, `rust`, `contracts` and `changes` all SUCCESS with `engine` skipping.
+**Re-derive every one of those with `gh pr view 87`, `gh pr checks 87`, `git log -1` and
+`git status`** — the SHAs and branch states written in this file have gone stale repeatedly,
+sometimes within hours, and that green is one CI run rather than a property of the branch: see
+`THE NINTH MECHANISM`.
+
+**IF YOU ARE PICKING THIS UP COLD, THE DECISION IN FRONT OF YOU IS "MERGE OR NOT", NOT "WHAT IS
+LEFT TO BUILD".** Nothing on the reader half is outstanding. Two independent reviews ran — the
+first found a Critical on the production path, the second found none and confirmed the fix held —
+and every finding from both is fixed with a test that fails when the fix is reverted, except five
+defensive branches recorded as uncovered on purpose. Merge is merge-only, never squash. After
+that, the queue below is the work.
 
 **THE ASSIGNMENT THAT STOOD HERE IS DONE, AND THE HEADLINE IT LEFT BEHIND WAS WRONG IN ONE
 DIRECTION THAT MATTERS.** The residue this file enumerated named the "0200 and empty" fault and
@@ -76,12 +89,14 @@ loop test reading one layer *below* what a production observation does. Fixed, a
 other findings, in the commit that follows `8613f22`. Read open item 1 for the full account; the
 methodological point is repeated there because it has now cost this branch twice.
 
-**VERIFIED at `ae03597`:** `cargo fmt --all --check` exit 0, `cargo clippy --workspace
---all-targets -- -D warnings` clean, `cargo test --workspace` **1532 passed, 0 failed, 49
-ignored**. The three race loops were additionally run twice at 30,000 cycles each with no
-unmarked failure; they are committed at 4096 cycles, where a mutation of either dominant
-classification is caught 3 of 3. **CI status at this head must be re-derived — do not trust a
-"green" written here.**
+**VERIFIED at `2a622f0`, on a machine with no leaked load on it:** `cargo fmt --all --check`
+exit 0, `cargo clippy --workspace --all-targets -- -D warnings` clean, and a complete
+`cargo test --workspace` — **85 suites, 1534 passed, 0 failed**, exit 0. The three race loops
+were additionally swept at 30,000 cycles and the observation loop three times at 40,000, none
+producing an unmarked failure; they are committed at 4096, where a mutation of either dominant
+classification is caught 3 of 3. **CI status at any later head must be re-derived — do not trust
+a "green" written here**, and read `THE NINTH MECHANISM` before treating one green local run as
+more than a data point.
 
 **Five defensive branches are recorded as NOT covered by a driving test, deliberately and not by
 oversight.** Two were listed by the first review — `empty_unlinked_inode`'s `st_nlink != 0`
