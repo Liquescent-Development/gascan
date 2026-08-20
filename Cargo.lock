@@ -519,6 +519,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gascan-conformance"
+version = "0.1.20"
+dependencies = [
+ "camino",
+ "gascan-core",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "gascan-core"
 version = "0.1.20"
 dependencies = [
