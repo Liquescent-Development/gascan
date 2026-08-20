@@ -3030,6 +3030,15 @@ is expected means a kill during the health phase left an operation looking succe
 is a description of the assertion and not a diagnosis; nobody has traced it. Do not repeat a
 guess about it as a finding.
 
+**It recurred on 2026-08-19 in run `32315397045`, at `cfcfb62` on PR #87, with the same test,
+the same line and the same two values — and that commit changes no code at all.**
+`git diff --name-only 93c77fe cfcfb62` returns `docs/status/START-HERE.md`, one Markdown file,
+and the immediately preceding head `93c77fe` had just settled `rust` SUCCESS on a re-run. That
+is the same cheapest-and-strongest exoneration the sixth mechanism's entry describes, and it is
+now the second time this file has been able to use it. **Two of the seven mechanisms have now
+been caught failing on Markdown-only commits**, which is worth knowing before anyone spends a
+session bisecting one of them against code.
+
 **THE SIXTH MECHANISM, FOUND 2026-08-19 AND NOT DIAGNOSED: an ephemeral-port collision in
 `gascand`'s `lifecycle` suite.** The `rust` job of run `32281948905`, on PR #87, failed with:
 
