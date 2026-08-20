@@ -486,6 +486,7 @@ dependencies = [
  "async-trait",
  "base64",
  "camino",
+ "gascan-conformance",
  "gascan-core",
  "libc",
  "rustix",
