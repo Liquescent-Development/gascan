@@ -3327,7 +3327,13 @@ fn open_published_record(
         Mode::empty(),
     )
     .map_err(|error| {
-        classify_unreadable_instance_record(error, &directory, name, paths.expected_uid)
+        classify_unreadable_instance_record(
+            error,
+            &directory,
+            name,
+            paths.expected_uid,
+            GuardedFile::InstanceRecord,
+        )
     })?;
     let identity = validate_open_file(
         &directory,
@@ -3568,7 +3574,13 @@ where
         Mode::empty(),
     )
     .map_err(|error| {
-        classify_unreadable_instance_record(error, &directory, name, paths.expected_uid)
+        classify_unreadable_instance_record(
+            error,
+            &directory,
+            name,
+            paths.expected_uid,
+            GuardedFile::InstanceRecord,
+        )
     })?;
     let actual = validate_open_file(
         &directory,
@@ -3619,30 +3631,51 @@ fn is_instance_tombstone(stat: &rustix::fs::Stat, expected_uid: u32) -> bool {
         && stat.st_size == 0
 }
 
-/// The one tear in a stop transition that no validator can classify, because no
-/// validator runs: this read opens `O_RDONLY`, and a retirement's rename puts a
-/// 0200 file at the name, so a reader that resolved a published identity and
-/// reached the open one instant late is refused by the kernel before
-/// `validate_file_stat` ever sees a `Stat`.
+/// The tears in a stop transition that no validator can classify, because no
+/// validator runs: the open is refused by the kernel before `validate_file_stat`
+/// ever sees a `Stat`. Both callers open the instance name -- the record read
+/// `O_RDONLY`, `open_published_record` `O_RDWR` -- and a retirement's rename puts
+/// a 0200 file there, so a reader that resolved a published identity and reached
+/// the open one instant late is refused.
 ///
 /// Classified by evidence rather than by declaration, which is what separates it
-/// from the `GuardedFile` split. `EACCES` on its own does not say what changed,
-/// so the name is looked at again: if it now names an inert tombstone the
-/// retirement this reader was racing has committed, and if it has gone entirely
-/// then something removed the record between two of this reader's own looks.
-/// Both settle on another observation. Anything else keeps the kernel's terminal
-/// verdict -- so a record chmod-ed to 0200 and *left* there, which is the
-/// tampering shape, still reaches the caller as `Unsafe` rather than as three
-/// polite retries.
+/// from the `GuardedFile` split -- though it takes `guarded` too, so that the
+/// terminal set stays defined in one place and a lock-guarding caller added later
+/// cannot inherit the record's retry classification by saying nothing.
 ///
-/// Only `EACCES` is split. Every other errno stays terminal, which is the
-/// direction that fails closed, and is the same narrowness
-/// `validate_instance_tombstone` holds for its own `ENOENT`.
+/// **Two errnos are split, and this is the whole rule:**
+///
+/// - `ENOENT` is retryable outright, without a recheck. Every caller arrives
+///   having just resolved this name, so its absence at the open is a successor's
+///   commit rather than an absent daemon, and what the name holds by the time we
+///   could look is beside the point.
+/// - `EACCES` is retryable only on evidence. The name is looked at again and
+///   handed to `validate_file_stat`: `Ok` means a legal published record is there
+///   now, and an `is_raced` fault means a face that validator already calls the
+///   path in motion -- the inert tombstone, or an inode a rename detached, which a
+///   torn `lstat` reports as `nlink == 0`. Deferring to that predicate rather than
+///   restating it is deliberate; two narrower hand-written versions were measured
+///   wrong, and the comment in the match arm records both.
+///
+/// Every other errno keeps the kernel's verdict without a recheck, and so does an
+/// `EACCES` whose recheck finds a face `validate_file_stat` refuses in every
+/// state -- the illegal 0200-with-content, a foreign owner, an extra link, a
+/// symlink, a mode nobody here writes. So a record chmod-ed to 0200 and *left*
+/// there still reaches the caller as `Unsafe` rather than as three polite
+/// retries. `ELOOP` in particular is the substitution `O_NOFOLLOW` exists to
+/// refuse and never becomes retryable.
+///
+/// **The raced arms carry the errno and the stat, and the terminal arm carries
+/// them too.** That is not symmetry for its own sake: a race that settles
+/// produces no message at all, so the raced detail is what `retry_while_raced`
+/// builds its give-up verdict from, and it is the only text a human ever sees
+/// when a path does not settle.
 fn classify_unreadable_instance_record(
     error: rustix::io::Errno,
     directory: &OwnedFd,
     name: &OsStr,
     expected_uid: u32,
+    guarded: GuardedFile,
 ) -> io::Error {
     // Every caller reaches this having just resolved `name` -- the record read
     // from `file_identity_at`, `open_published_record` from the read that handed
@@ -3651,7 +3684,7 @@ fn classify_unreadable_instance_record(
     // looks. Left bare it is `NotFound`, which
     // `read_instance_record_for_inspection` maps to `Ok(None)` -- a confident
     // "stopped" for a daemon that is mid-transition.
-    if error == rustix::io::Errno::NOENT {
+    if error == rustix::io::Errno::NOENT && matches!(guarded, GuardedFile::InstanceRecord) {
         return raced("the daemon instance record was unlinked before it could be opened");
     }
     if error != rustix::io::Errno::ACCESS {
@@ -3672,14 +3705,32 @@ fn classify_unreadable_instance_record(
         // missed a re-stat that tore across the retirement itself (`mode=0200
         // size=0 nlink=0`). Deferring to `is_transitional_for` covers all three and
         // keeps the terminal set defined in exactly one place.
-        Ok(stat) => match validate_file_stat(&stat, expected_uid, GuardedFile::InstanceRecord) {
-            Ok(()) => raced(
+        Ok(stat) => match validate_file_stat(&stat, expected_uid, guarded) {
+            // Both raced arms carry the errno and the stat, and that is the
+            // opposite of the obvious instinct: a race that *settles* produces no
+            // message at all, so the raced detail is not the throwaway half. It is
+            // what `retry_while_raced` builds its give-up verdict from, which makes
+            // it the only text a human sees when a path never settles.
+            //
+            // A persistent `EACCES` over a stat that reads as a legal published
+            // record -- a same-uid deny ACL on macOS, an LSM denial on Linux --
+            // lands here and never settles. Without the errno the operator is told
+            // "a publication committed over the record", naming a transition that
+            // never happened, with the `EACCES` discarded.
+            Ok(()) => raced(&format!(
                 "a publication committed over the daemon instance record between \
-                 resolving it and opening it",
-            ),
+                 resolving it and opening it, or the open was refused for another \
+                 reason: {} (it wears mode {:04o}, size {}, links {}, uid {})",
+                errno(error),
+                Mode::from_raw_mode(stat.st_mode).bits() & 0o777,
+                stat.st_size,
+                stat.st_nlink,
+                stat.st_uid
+            )),
             Err(moving) if is_raced(&moving) => raced(&format!(
                 "the daemon instance record was retired between resolving it and \
-                 opening it: {moving}"
+                 opening it: {}: {moving}",
+                errno(error)
             )),
             // The name holds something this reader will not accept in any state --
             // the illegal 0200-with-content face, a foreign owner, an extra link, a
@@ -6972,11 +7023,28 @@ mod tests {
     /// mode is `fs::write`'s `0666` masked by the running process's umask (`420`
     /// is `0o644`, i.e. umask `022`) and the size is whatever payload was passed.
     /// The shape of the defect is what carries over; the numbers do not.
+    /// Each step names itself on failure, which is not decoration.
+    ///
+    /// On 2026-08-19 a full-suite run failed
+    /// `every_reader_failure_across_a_real_stop_transition_is_marked_raced` with a
+    /// bare `Os { code: 2, kind: NotFound }` from this helper and nothing else --
+    /// no assertion, no step, no path. It did not reproduce: 25 isolated runs of
+    /// that test and 20 full-suite runs with these three messages temporarily in
+    /// place produced **zero** further sightings, so the cause is unattributed
+    /// rather than diagnosed. The messages stay so that a second sighting costs a
+    /// successor nothing to place.
     fn commit_at_instance(paths: &DaemonPaths, contents: &[u8], mode: u32) -> TestResult {
         let staging = paths.directory().join(".observer-staging");
-        fs::write(&staging, contents)?;
-        fs::set_permissions(&staging, fs::Permissions::from_mode(mode))?;
-        fs::rename(&staging, paths.instance())?;
+        fs::write(&staging, contents).map_err(|error| {
+            format!(
+                "staging write failed: {staging:?} (directory present: {}): {error}",
+                paths.directory().exists()
+            )
+        })?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("staging chmod failed: {staging:?}: {error}"))?;
+        fs::rename(&staging, paths.instance())
+            .map_err(|error| format!("staging rename failed: {staging:?}: {error}"))?;
         Ok(())
     }
 
@@ -7299,6 +7367,12 @@ mod tests {
             is_raced(&error),
             "a publication committing inside the reader's window is a race, not a fault: {error}"
         );
+        assert_eq!(
+            error.to_string(),
+            "daemon instance record changed while opening it",
+            "this test owns the identity-to-open window; a different message means the \
+             injection point moved and the test is now proving the other window twice"
+        );
         Ok(())
     }
 
@@ -7337,6 +7411,12 @@ mod tests {
         assert!(
             is_raced(&error),
             "a publication committing inside the reader's window is a race, not a fault: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "daemon instance record changed while reading it",
+            "this test owns the read-to-recheck window; a different message means the \
+             injection point moved and the test is now proving the other window twice"
         );
         Ok(())
     }
@@ -7758,12 +7838,30 @@ mod tests {
                 &directory,
                 std::ffi::OsStr::new(name),
                 expected_uid,
+                super::GuardedFile::InstanceRecord,
             );
             assert_eq!(
                 is_raced(&classified),
                 retryable,
                 "{face} was classified wrongly: {classified}"
             );
+            // Every verdict this helper builds from an `EACCES` carries the errno
+            // and the observed face, retryable ones included. The retryable ones
+            // are the load-bearing case: a race that settles produces no message,
+            // so the raced detail is what `retry_while_raced` puts in front of a
+            // human when the path never settles. A persistent `EACCES` over a stat
+            // that reads as a legal published record lands exactly there.
+            let report = classified.to_string();
+            for field in [
+                super::errno(rustix::io::Errno::ACCESS).to_string(),
+                format!("mode {mode:04o}"),
+            ] {
+                assert!(
+                    report.contains(&field),
+                    "{face} produced a verdict missing {field:?}, which is the \
+                     evidence a human needs and cannot recover: {report}"
+                );
+            }
             fs::remove_file(&path)?;
         }
 
@@ -7774,6 +7872,7 @@ mod tests {
             &directory,
             std::ffi::OsStr::new("instance"),
             uid,
+            super::GuardedFile::InstanceRecord,
         );
         assert!(is_raced(&gone), "a vanished name must be retryable: {gone}");
 
@@ -7789,6 +7888,7 @@ mod tests {
             &directory,
             std::ffi::OsStr::new("instance"),
             uid,
+            super::GuardedFile::InstanceRecord,
         );
         assert!(
             is_raced(&vanished),
@@ -7805,6 +7905,7 @@ mod tests {
             &directory,
             std::ffi::OsStr::new("instance"),
             uid,
+            super::GuardedFile::InstanceRecord,
         );
         assert!(
             !is_raced(&looped),

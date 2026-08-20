@@ -9,7 +9,8 @@ from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual 
 retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
 merged**. Everything above the `Where the work is` heading is current; everything below it is
 history, **with three exceptions added 2026-08-19 that are current**: the sections headed
-`THE FOURTH MECHANISM` through `THE EIGHTH MECHANISM`, which describe live CI flakes.
+`THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which describe live CI flakes — and the
+ninth is about the *local* suite, so read it before trusting a green local run.
 
 ---
 
@@ -82,21 +83,25 @@ unmarked failure; they are committed at 4096 cycles, where a mutation of either 
 classification is caught 3 of 3. **CI status at this head must be re-derived — do not trust a
 "green" written here.**
 
-**Three defensive branches are recorded as NOT covered by a driving test, deliberately and not
-by oversight:** `stage_inert_reclaim_file`'s new staging-name check — unreachable by construction,
-since the staging name is freshly created under `O_EXCL` and unguessable — joining the two the
-previous review already listed the same way (`empty_unlinked_inode`'s `st_nlink != 0` refusal and
-`validate_retired_tombstone`'s rename check). Open item 1 has been rewritten end to end; read it
-there before assuming anything named in this file is still open.
+**Five defensive branches are recorded as NOT covered by a driving test, deliberately and not by
+oversight.** Two were listed by the first review — `empty_unlinked_inode`'s `st_nlink != 0`
+refusal and `validate_retired_tombstone`'s rename check. Three came out of this work:
+`stage_inert_reclaim_file`'s staging-name check and the **cleanup guard beside it** (a second
+review MEASURED both directions of that guard — deleting it, and inverting it so it unlinks
+precisely a stranger's file — leaving `cargo test -p gascan --lib` green at 324 both times), and
+`open_published_record`'s recheck-`statat` `ENOENT` split. All five are unreachable by
+construction on every path traced. Open item 1 has been rewritten end to end; read it there before
+assuming anything named in this file is still open.
 
 **THE READER HALF IS DONE, SO THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
 and the maintainer chooses from it:
 
-1. **The five unfixed CI flake mechanisms this file names** — the empty pid-file read, the
+1. **The six unfixed flake mechanisms this file names** — the empty pid-file read, the
    `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
    collision, a `lifecycle` container left `Running` after a rejected `up`, and a 250ms
-   wall-clock bound in `gascan-e2e`'s PTY signal test. All five are written up under the headings
-   `THE FOURTH MECHANISM` through `THE EIGHTH MECHANISM`, which sit *below* the
+   wall-clock bound in `gascan-e2e`'s PTY signal test, and four flaky tests in `gascan --lib`
+   itself. All six are written up under the headings
+   `THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which sit *below* the
    `Where the work is` heading despite being current. **Two of them are different tests in the
    same `lifecycle` target**, so "the `lifecycle` flake" is not one thing — and **the eighth is
    the only one whose fix does not require diagnosing a race first**, because its pass condition
@@ -3126,9 +3131,56 @@ and nothing else.
 At `93c77fe`, `cfcfb62` and `ec47492` the `rust` job failed on **three different tests in three
 different crates** — `gascand`'s `lifecycle`, `gascand`'s `reconcile`, and `gascan-e2e`'s
 `apple_common` — and **the last two commits contain no code at all**. A green `rust` on this
-branch is currently the exception, and the local `cargo test --workspace` (85 suites, 1534
-passed, 0 failed at `93c77fe`) is the signal that means anything. Do not read a red `rust` here
-as evidence about a branch until `git diff --name-only` has been run against the failing commit.
+branch is currently the exception. Do not read a red `rust` here as evidence about a branch until
+`git diff --name-only` has been run against the failing commit.
+
+~~and the local `cargo test --workspace` is the signal that means anything.~~ **Corrected the same
+day, and this correction matters more than the sentence it replaces: the local suite flakes at
+roughly the same rate CI does.** `cargo test -p gascan --lib` failed 12 times in 43 runs — see
+`THE NINTH MECHANISM` below. A single green local run is a data point, not a gate, and any durable
+claim of the form "N passed each of M runs" needs the load conditions attached, because mine did
+not reproduce and the machine turned out to be carrying four leaked CPU burners at the time.
+
+**THE NINTH MECHANISM, FOUND 2026-08-19: `cargo test -p gascan --lib` fails about a third of the
+time on this machine, across four distinct tests.** This is the entry that should change how
+anyone reads the other eight, because `gascan --lib` is the suite this file had been treating as
+the trustworthy local signal.
+
+MEASURED on 2026-08-19, running exactly `cargo test -p gascan --lib` and nothing beside it:
+
+| run set | conditions | failures |
+|---|---|---|
+| 8 runs | four spinning `yes` processes present (see below) | 2 |
+| 20 runs | same, with fixture step-attribution compiled in | 4 |
+| 15 runs | quiet machine | **6** |
+
+**43 runs, 12 failures — about 28% overall, and 40% in the unloaded set.** The four tests are
+`inherited_startup_diagnostic_survives_path_replacement` (7 of the 12, the dominant one),
+`start_readiness_waits_for_its_own_connected_publication_to_finish`,
+`tombstone_recovery_retires_held_residue_after_bounded_endpoint_reinspection`, and one
+unattributed sighting described below. **None is reproducible in isolation**: the one test that
+was tried alone ran 25 times with 0 failures. An independent review measured the same shape
+separately, including **1 failure in 6 at the parent commit `8613f22`**, so none of this is a
+regression from the reader work.
+
+**Read the conditions column, because the first two sets were measured under load I did not know
+was there.** A review subagent left four `yes` processes spinning; they were found at 68 minutes
+of CPU each and killed by PID. The naive expectation is that this inflated the failure rate. **It
+did not** — the quiet-machine set is the *worst* of the three, 6 in 15. The load was a confound in
+the honest sense that the numbers could not be interpreted until it was removed, not in the sense
+that it explains the flakes away.
+
+**One of the twelve is unattributed and stays that way.**
+`every_reader_failure_across_a_real_stop_transition_is_marked_raced` failed once with a bare
+`Os { code: 2, kind: NotFound }` out of the `commit_at_instance` fixture. It did not reproduce in
+25 isolated runs, nor in 20 full-suite runs with per-step attribution temporarily compiled in.
+The three step messages were **kept** in `commit_at_instance` so a second sighting names its own
+syscall. Do not write down a cause for it; nobody has one.
+
+`start_readiness_waits_for_its_own_connected_publication_to_finish` is the one with a visible
+shape, same class as the eighth: it gives `start_with` `readiness: 200ms` with `poll: 1ms`, so a
+loaded machine misses the budget. Like the eighth, its fix is a design call rather than a race
+hunt.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
