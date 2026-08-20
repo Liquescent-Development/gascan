@@ -6,9 +6,9 @@ addressed to you, the agent. Follow it as instructions — there is nothing to p
 Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day after the daemon
 instance record's publish race was fixed and merged (PR #80, #81). Updated again 2026-08-19,
 from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
-retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
-merged**. Updated again the same day after two review rounds closed it and CI went green.
-Everything above the `Where the work is` heading is current; everything below it is
+retryable verdict — was implemented there and opened as PR #87. **Updated 2026-08-20: PR #87 IS
+MERGED, open item 1 is closed entire, and the queue in the block below is now the whole
+assignment.** Everything above the `Where the work is` heading is current; everything below it is
 history, **with six exceptions added 2026-08-19 that are current**: the sections headed
 `THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which describe live CI flakes — and the
 ninth is about the *local* suite, so read it before trusting a green local run.
@@ -17,106 +17,64 @@ ninth is about the *local* suite, so read it before trusting a green local run.
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**PR #87 IS OPEN, THE READER HALF IS COMPLETE, TWO REVIEW ROUNDS ARE DISCHARGED, AND CI IS
-GREEN. IT IS NOT MERGED — that is the maintainer's call and the only thing left on it.** Branch
-`fix/daemon-reader-retryable-verdict` carries open item 1 entire, producer and reader. At the
-time of writing it is **33 commits off `main` at merge-base `61f1b3c`**
-(`git merge-base main fix/daemon-reader-retryable-verdict` →
-`61f1b3c64b10decbd6548543d9e6bfccbcdac048`), head `903ef05`. At that head `gh pr checks 87`
-reported `gate`, `rust`, `contracts` and `changes` all SUCCESS with `engine` skipping, and
-`gh pr view 87` reported **`mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`, not a draft**.
+**PR #87 IS MERGED. OPEN ITEM 1 IS CLOSED ENTIRE, PRODUCER AND READER. THE QUEUE BELOW IS THE
+WHOLE ASSIGNMENT — there is nothing left to decide about the reader half.** Merged 2026-08-20 as
+a true merge commit, not a squash: `7e84646`, parents `61f1b3c` (main) + `be19551` (branch),
+per `git log origin/main -2 --format='%h %p %s'`. All 35 commits survive
+(`git rev-list --count 61f1b3c..7e84646` → 35), and `git merge-base --is-ancestor` confirms
+`3e2cc9e`, `ae03597`, `8613f22`, `93c77fe`, `2a622f0` and `be19551` are each reachable from
+`main` — which is the point of merge-only here, because the docs below cite those SHAs and a
+squash would mint new ones and invalidate every citation.
 
-The commit carrying this sentence makes it 34 and moves the head, which is the staleness this
-file keeps warning about arriving inside the warning again — so **re-derive every one of those
-with `gh pr view 87`, `gh pr checks 87`, `git log -1` and `git status`** rather than believing
-the numbers above. Note also that the green is one CI run rather than a property of the branch;
-see `THE NINTH MECHANISM` before treating it as more.
+**Re-derive anything you are about to rely on** with `git log -1`, `git status` and `gh run list`.
+This file's own history is of going stale within hours, twice inside the very warning about it.
 
-**BOTH REVIEWS ARE COMMITTED, and they are the two documents to read if you are deciding whether
-to merge:** `docs/status/review-daemon-reader-half.md` (round one — found the Critical) and
-`docs/status/review-daemon-reader-fixes.md` (round two — found none, confirmed the fix held).
-They carry their own measurements, including several this file only summarises, and round two's
-"Checked and found sound" section records what was attacked and survived, which is the part worth
-having before anyone re-opens a settled question.
+**WHAT THE MERGE RESTED ON, AND WHAT WAS RE-MEASURED RATHER THAN READ.** The branch carried three
+review rounds, only two of which are committed. Round zero reviewed the producer half; its five
+minors reached the tree at `d5ea334`, and its document was not retained. Round one
+(`docs/status/review-daemon-reader-half.md`, `bf107a1..8613f22`) found a Critical on the
+production path. Round two (`docs/status/review-daemon-reader-fixes.md`, `8613f22..93c77fe`)
+found **no Critical** but its verdict line reads **`request changes`** — three Importants and four
+Minors — and those fixes landed in `2a622f0`. **`2a622f0` was never independently re-reviewed.**
+That was the one real gap in the merge case, and because this branch had already shipped a commit
+claiming three things it did not deliver (`93c77fe`, caught only by round two), the discharge was
+verified by mutation rather than by reading the commit message. MEASURED at `be19551` on a clean
+tree, each mutation applied from a backup copy and reverted:
 
-**IF YOU ARE PICKING THIS UP COLD, THE DECISION IN FRONT OF YOU IS "MERGE OR NOT", NOT "WHAT IS
-LEFT TO BUILD".** Nothing on the reader half is outstanding. Two independent reviews ran — the
-first found a Critical on the production path, the second found none and confirmed the fix held —
-and every finding from both is fixed with a test that fails when the fix is reverted, except five
-defensive branches recorded as uncovered on purpose. Merge is merge-only, never squash. After
-that, the queue below is the work.
+| what was mutated | driving test | result |
+|---|---|---|
+| round one's Critical — `open_published_record`'s `openat` reverted to `.map_err(errno)` (`daemon.rs:3329`) | `every_unsafe_observation_across_a_real_stop_transition_is_marked_raced` | **FAILED 3 of 3** |
+| round two's I1 — the two `ReadHooks` field bindings swapped in the destructure (`daemon.rs:3541-3545`) | `a_record_republished_before_the_reader_opens_it_is_raced` **and** `..._rechecks_it_is_raced` | **both FAILED**, each naming its own window; 322 passed, 2 failed, exit 101 |
+| round two's I3 — `errno(error)` dropped from the retirement raced arm | `the_unreadable_record_classifier_admits_only_faces_in_motion` | **FAILED** |
 
-**THE ASSIGNMENT THAT STOOD HERE IS DONE, AND THE HEADLINE IT LEFT BEHIND WAS WRONG IN ONE
-DIRECTION THAT MATTERS.** The residue this file enumerated named the "0200 and empty" fault and
-the `EACCES` as the motivating case's tears. It missed the largest one. MEASURED at `bf107a1`
-with a temporary probe not retained in the tree — one reader spinning on
-`read_instance_record_for_inspection` against a publish-and-retire loop, over five seconds:
+Round two's M4 is discharged by inspection: `classify_unreadable_instance_record` takes
+`GuardedFile` as a parameter and `open_published_record` passes it at `daemon.rs:3335`. I2, M1 and
+M3 are doc-comment and uncovered-branch bookkeeping — they cannot produce a wrong verdict by
+construction, and they were not mutation-tested. **That is the honest limit of what was
+re-verified.**
 
-| unmarked fault | samples |
-|---|---|
-| `link count is not one (mode 0600, links 0)` | **2426** |
-| `mode is 0200 and the file is empty` | 1138 |
-| bare `EACCES` from the `O_RDONLY` `openat` | 11 |
+**At the pristine tree at `be19551`:** `cargo fmt --all --check` exit 0,
+`cargo clippy --workspace --all-targets -- -D warnings` no issues, and
+`cargo test -p gascan --lib` **324 passed, 0 failed** on four consecutive runs. Four greens is a
+data point, not a property — `THE NINTH MECHANISM` records 12 failures in 43 runs (~28%) of that
+same command, so read it before trusting any green local run, including these.
 
-The `nlink == 0` tear — the reader still holding the inode a rename unlinked — was the *most
-common* way a `gascan status` tore across an ordinary stop, and it was in neither the residue
-list nor the design. It was found by writing the end-to-end test the file admitted did not
-exist, which is the lesson worth carrying: the enumeration in a handoff doc is a hypothesis.
+**CI, and a correction to what this file said before.** The previous revision recorded the green
+as being at `be19551`'s *parent*. It was green at `be19551` itself: `gh api .../commits/be19551/
+check-runs` returned `gate`, `rust`, `contracts` and `changes` all `success` with `engine`
+`skipped`, and `gh pr view 87` reported `mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`, not a
+draft, immediately before the merge. On `main` at the merge commit `7e84646`, `rust` — which is
+exactly `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace`, per `.github/workflows/ci.yml:51-57` — completed **success**, as did
+`contracts` and `changes`. Note `engine` is `skipped` on a PR and actually runs on `main`.
 
-**WHAT LANDED, all in `ae03597`.** The file being guarded is now a parameter, `GuardedFile`
-(`LifecycleLock` | `InstanceRecord`), threaded through `validate_file_stat`, `validate_open_file`
-and `file_identity_at`; the faults became values, and `StatFault::is_transitional_for` holds the
-**entire** widening in one function — `Unlinked` and `InertTombstone`, for `InstanceRecord` only.
-Production `raced()` constructor sites went from 5 to **16**; count them yourself with
-`awk 'NR<4450 && /raced\(/' crates/gascan/src/daemon.rs` rather than trusting either number.
+**A FRESH INSTANCE OF THE TRAP IN POINT 1 BELOW, worth having before you diagnose anything red.**
+`main`'s tip immediately before this merge, `61f1b3c`, has a **red** CI run — `gate`, `rust` and
+`engine` all `failure`. `git show --stat 61f1b3c` is a docs-only merge of PR #86: **one file, 266
+insertions, markdown**. There is no code in it. A red `rust` there is a flake, exonerated by diff
+alone. Run `git diff --name-only` before you spend an hour on a red run.
 
-**What deliberately did NOT move, and this is the line to defend:** `0200` *with content* stays
-terminal, per the three-face rule — nothing will finish that record, so a retry would report a
-permanently stuck one as a passing squall. Foreign owner, non-regular file, extra hard links and
-wrong modes stay terminal everywhere, the instance record included. The lifecycle lock treats
-every fault as a fault, including the two that are transitions for the record, and
-`the_lifecycle_lock_treats_every_fault_as_terminal` is what holds that.
-
-**The retry composition is sealed.** `observe::sealed` holds `inspect_with_hook`,
-`retry_while_raced` and `observe_once_with_hook`; only the first leaves the module. The mutation
-the previous review measured as silently green — rewriting `inspect_with`'s delegation to call
-the observation directly — is now a compile error, VERIFIED: `cargo build -p gascan` fails with
-E0425, ``cannot find function `observe_once_with_hook` in module `observe` ``. Note the review's
-premise was off by one: `inspect_with_hook` has **two** legitimate callers, not one —
-`inspect_with` and `ensure_started_locked_with_hook`'s readiness loop.
-
-**All five review minors are now fixed**, not four; the fifth was the module seal above. Three of
-the other four are held by a test that fails when the fix is reverted; `stage_inert_reclaim_file`'s
-staging-name check is not, and is listed with the uncovered branches below.
-
-**A second review round on `bf107a1..8613f22` found a Critical this file had already declared
-closed, and it was on the production path.** `open_published_record`'s `openat` was unclassified,
-so an ordinary stop still produced terminal `Unsafe` verdicts — MEASURED, 4456 of them in 20,000
-observations, 100% of the unmarked ones. The cause was that the completeness claim rested on a
-loop test reading one layer *below* what a production observation does. Fixed, along with four
-other findings, in the commit that follows `8613f22`. Read open item 1 for the full account; the
-methodological point is repeated there because it has now cost this branch twice.
-
-**VERIFIED at `2a622f0`, on a machine with no leaked load on it:** `cargo fmt --all --check`
-exit 0, `cargo clippy --workspace --all-targets -- -D warnings` clean, and a complete
-`cargo test --workspace` — **85 suites, 1534 passed, 0 failed**, exit 0. The three race loops
-were additionally swept at 30,000 cycles and the observation loop three times at 40,000, none
-producing an unmarked failure; they are committed at 4096, where a mutation of either dominant
-classification is caught 3 of 3. **CI status at any later head must be re-derived — do not trust
-a "green" written here**, and read `THE NINTH MECHANISM` before treating one green local run as
-more than a data point.
-
-**Five defensive branches are recorded as NOT covered by a driving test, deliberately and not by
-oversight.** Two were listed by the first review — `empty_unlinked_inode`'s `st_nlink != 0`
-refusal and `validate_retired_tombstone`'s rename check. Three came out of this work:
-`stage_inert_reclaim_file`'s staging-name check and the **cleanup guard beside it** (a second
-review MEASURED both directions of that guard — deleting it, and inverting it so it unlinks
-precisely a stranger's file — leaving `cargo test -p gascan --lib` green at 324 both times), and
-`open_published_record`'s recheck-`statat` `ENOENT` split. All five are unreachable by
-construction on every path traced. Open item 1 has been rewritten end to end; read it there before
-assuming anything named in this file is still open.
-
-**THE READER HALF IS DONE, SO THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
+**THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
 and the maintainer chooses from it:
 
 1. **The six unfixed flake mechanisms this file names** — the empty pid-file read, the
@@ -432,9 +390,11 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
 
 ### WHAT IS OPEN
 
-1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). THE READER'S
-   HALF — THIS ITEM'S RESIDUAL — IS NOW COMPLETE ON `fix/daemon-reader-retryable-verdict`, OPEN
-   AS PR #87 AND STILL UNMERGED BY THE MAINTAINER'S CHOICE.**
+1. **CLOSED 2026-08-20 — THIS ITEM IS NO LONGER OPEN, AND IS KEPT ONLY BECAUSE THE ACCOUNT BELOW
+   IS THE RECORD OF HOW IT WAS CLOSED.** The publish race was fixed and merged (`025b922`); the
+   reader's half — this item's residual — was completed on `fix/daemon-reader-retryable-verdict`
+   and **merged as PR #87 in merge commit `7e84646`** (parents `61f1b3c` + `be19551`). Nothing in
+   this item is an assignment. The assignment is the queue in the cold-start block.
 
    ~~THAT HALF IS PARTIAL AND THE RESIDUE INCLUDES THE COMMON CASE.~~ **Superseded `ae03597`:
    the common case is covered, and the residue list this item carried was itself incomplete —
