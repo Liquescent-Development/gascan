@@ -503,6 +503,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
+ "gascan-conformance",
  "gascan-core",
  "gascan-engine-proto",
  "gascan-oci-fixture",
