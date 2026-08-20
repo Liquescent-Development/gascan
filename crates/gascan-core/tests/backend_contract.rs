@@ -625,21 +625,6 @@ fn validated_fixture_keeps_its_canonical_bind_source_alive() {
 }
 
 #[tokio::test]
-async fn duplicate_create_is_rejected_and_start_stop_are_idempotent() {
-    let backend = FakeRuntime::new(capabilities());
-    let fixture = create_request("lifecycle");
-    let id = fixture.id().clone();
-    backend.create(fixture.request()).await.unwrap();
-    let error = backend.create(fixture.request()).await.unwrap_err();
-    assert_eq!(error.code(), "resource_conflict");
-
-    backend.start(&id).await.unwrap();
-    backend.start(&id).await.unwrap();
-    backend.stop(&id).await.unwrap();
-    backend.stop(&id).await.unwrap();
-}
-
-#[tokio::test]
 async fn inventory_keeps_unowned_resources_observable() {
     let backend = FakeRuntime::new(capabilities());
     let fixture = create_request("owned");

@@ -105,6 +105,18 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
         backend.inspect(&id).await.unwrap().unwrap().state,
         ContainerState::Stopped
     );
+    // A second `create` of an id the backend already holds is a conflict, not a
+    // silent re-create. Each backend detects this its own way -- the fake by
+    // map lookup, apple by pre-flight inventory scan, arca engine-side -- so the
+    // stable code is the only portable thing to assert.
+    assert_eq!(
+        backend.create(fixture.request()).await.unwrap_err().code(),
+        "resource_conflict"
+    );
+    // Doubled deliberately: `start` and `stop` are idempotent, so the second
+    // call of each must succeed and not report the sandbox's current state as
+    // an error. Collapsing either pair deletes the assertion.
+    backend.start(&id).await.unwrap();
     backend.start(&id).await.unwrap();
     let mut session = backend
         .exec(ExecRequest::fixture(id.clone(), ["true"]))
@@ -115,6 +127,7 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
         session.next().await.unwrap().unwrap(),
         ExecOutput::Exit { code: 0, signal: 0 }
     );
+    backend.stop(&id).await.unwrap();
     backend.stop(&id).await.unwrap();
     backend
         .remove(RemoveRequest::from_resources(created.created().to_vec()).unwrap())
