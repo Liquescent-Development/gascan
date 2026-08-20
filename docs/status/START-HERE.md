@@ -20,17 +20,17 @@ ninth is about the *local* suite, so read it before trusting a green local run.
 **PR #87 IS OPEN, THE READER HALF IS COMPLETE, TWO REVIEW ROUNDS ARE DISCHARGED, AND CI IS
 GREEN. IT IS NOT MERGED — that is the maintainer's call and the only thing left on it.** Branch
 `fix/daemon-reader-retryable-verdict` carries open item 1 entire, producer and reader. At the
-time of writing it is **31 commits off `main` at merge-base `61f1b3c`**
-(`git rev-list --count main..fix/daemon-reader-retryable-verdict` → 31 as of head `2a622f0`,
-and the commit carrying this sentence makes it 32 — which is the staleness this file keeps
-warning about, arriving inside the warning again;
-`git merge-base main fix/daemon-reader-retryable-verdict` →
-`61f1b3c64b10decbd6548543d9e6bfccbcdac048`), head `2a622f0`, and at that head `gh pr checks 87`
-reported `gate`, `rust`, `contracts` and `changes` all SUCCESS with `engine` skipping.
-**Re-derive every one of those with `gh pr view 87`, `gh pr checks 87`, `git log -1` and
-`git status`** — the SHAs and branch states written in this file have gone stale repeatedly,
-sometimes within hours, and that green is one CI run rather than a property of the branch: see
-`THE NINTH MECHANISM`.
+time of writing it is **33 commits off `main` at merge-base `61f1b3c`**
+(`git merge-base main fix/daemon-reader-retryable-verdict` →
+`61f1b3c64b10decbd6548543d9e6bfccbcdac048`), head `903ef05`. At that head `gh pr checks 87`
+reported `gate`, `rust`, `contracts` and `changes` all SUCCESS with `engine` skipping, and
+`gh pr view 87` reported **`mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`, not a draft**.
+
+The commit carrying this sentence makes it 34 and moves the head, which is the staleness this
+file keeps warning about arriving inside the warning again — so **re-derive every one of those
+with `gh pr view 87`, `gh pr checks 87`, `git log -1` and `git status`** rather than believing
+the numbers above. Note also that the green is one CI run rather than a property of the branch;
+see `THE NINTH MECHANISM` before treating it as more.
 
 **BOTH REVIEWS ARE COMMITTED, and they are the two documents to read if you are deciding whether
 to merge:** `docs/status/review-daemon-reader-half.md` (round one — found the Critical) and
