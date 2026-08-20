@@ -111,24 +111,17 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
     // stable code is the only portable thing to assert.
     let conflict = backend.create(fixture.request()).await.unwrap_err();
     assert_eq!(conflict.code(), "resource_conflict");
-    // Cleanup, not a claim. A rejected `create` may still have built resources
-    // before it hit the collision, and the `remove` at the end of this walk
-    // knows only about the first create's. Nothing is asserted about what the
-    // list holds: `is_empty()` would be a portability claim, and arca's own live
-    // suite predicts arca would fail it.
-    //
-    // No-op on every backend today -- the fake's map lookup
-    // (`gascan-core/src/fake_runtime.rs:695`) and apple's pre-flight inventory
-    // scan (`gascan-apple/src/backend.rs:238-252`) both fire before a single
-    // resource is made, and arca does not reach this line. It is here for live
-    // engines, where a conflicting create has been measured reporting the three
-    // volumes it had made (`gascan-arca/tests/live/lifecycle.rs:275-283`).
-    if !conflict.created().is_empty() {
-        backend
-            .remove(RemoveRequest::from_resources(conflict.created().to_vec()).unwrap())
-            .await
-            .unwrap();
-    }
+    // `conflict.created()` is deliberately neither removed nor asserted about.
+    // A rejected `create` may report resources it built before the collision,
+    // but both creates here use the same request, so those names are the live
+    // sandbox's own -- removing them would tear down the sandbox this walk still
+    // has to start, exec, stop and remove. The one live measurement of a
+    // conflicting create reporting what it made
+    // (`gascan-arca/tests/live/lifecycle.rs:259-278`) does not settle this case:
+    // there the container and volumes had been removed first and only the
+    // network name was still held, so its three volumes were genuinely
+    // orphaned. What a same-request collision reports is unmeasured everywhere.
+
     // Doubled deliberately: `start` and `stop` are idempotent, so the second
     // call of each must succeed and not report the sandbox's current state as
     // an error. Collapsing either pair deletes the assertion.
