@@ -7,8 +7,9 @@ Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day afte
 instance record's publish race was fixed and merged (PR #80, #81). Updated again 2026-08-19,
 from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
 retryable verdict — was implemented there and opened as **PR #87, which is deliberately not
-merged**. Everything above the `Where the work is` heading is current; everything below it is
-history, **with three exceptions added 2026-08-19 that are current**: the sections headed
+merged**. Updated again the same day after two review rounds closed it and CI went green.
+Everything above the `Where the work is` heading is current; everything below it is
+history, **with six exceptions added 2026-08-19 that are current**: the sections headed
 `THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which describe live CI flakes — and the
 ninth is about the *local* suite, so read it before trusting a green local run.
 
@@ -30,6 +31,13 @@ reported `gate`, `rust`, `contracts` and `changes` all SUCCESS with `engine` ski
 `git status`** — the SHAs and branch states written in this file have gone stale repeatedly,
 sometimes within hours, and that green is one CI run rather than a property of the branch: see
 `THE NINTH MECHANISM`.
+
+**BOTH REVIEWS ARE COMMITTED, and they are the two documents to read if you are deciding whether
+to merge:** `docs/status/review-daemon-reader-half.md` (round one — found the Critical) and
+`docs/status/review-daemon-reader-fixes.md` (round two — found none, confirmed the fix held).
+They carry their own measurements, including several this file only summarises, and round two's
+"Checked and found sound" section records what was attacked and survived, which is the part worth
+having before anyone re-opens a settled question.
 
 **IF YOU ARE PICKING THIS UP COLD, THE DECISION IN FRONT OF YOU IS "MERGE OR NOT", NOT "WHAT IS
 LEFT TO BUILD".** Nothing on the reader half is outstanding. Two independent reviews ran — the
@@ -618,12 +626,18 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    because `cargo clippy --workspace --all-targets` compiles the lib target without `cfg(test)`.
    Recorded in the `observe` module's own doc comment too.
 
-   **WHAT IS STILL NOT COVERED BY A DRIVING TEST, and it is three defensive branches, all
-   recorded rather than missed:** `stage_inert_reclaim_file`'s new staging-name comparison, plus
-   the two the previous review already listed — `empty_unlinked_inode`'s `st_nlink != 0` refusal
-   and `validate_retired_tombstone`'s "staged tombstone changed while being renamed into place"
-   check. All three are unreachable by construction on every path traceable in the tree. If any
-   is ever reported in the field it will be the first time it has run.
+   **WHAT IS STILL NOT COVERED BY A DRIVING TEST, and it is five defensive branches, all
+   recorded rather than missed:**
+
+   - `empty_unlinked_inode`'s `st_nlink != 0` refusal, and `validate_retired_tombstone`'s "staged
+     tombstone changed while being renamed into place" check — the two the first review listed.
+   - `stage_inert_reclaim_file`'s staging-name comparison, and **the cleanup guard beside it**.
+     The second review MEASURED both directions of that guard: deleting it, and inverting it so it
+     unlinks precisely a stranger's file, each left `cargo test -p gascan --lib` at 324 passed.
+   - `open_published_record`'s recheck-`statat` `ENOENT` split.
+
+   All five are unreachable by construction on every path traceable in the tree. If any is ever
+   reported in the field it will be the first time it has run.
 
    **How the coverage is actually held, because the shape matters for anyone extending it.**
    Three loop tests drive real producers and assert that *every* failure the reader produces is
