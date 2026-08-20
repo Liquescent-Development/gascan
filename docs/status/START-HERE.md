@@ -9,9 +9,10 @@ from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual 
 retryable verdict — was implemented there and opened as PR #87. **Updated 2026-08-20: PR #87 IS
 MERGED, open item 1 is closed entire, and the queue in the block below is now the whole
 assignment.** Everything above the `Where the work is` heading is current; everything below it is
-history, **with six exceptions added 2026-08-19 that are current**: the sections headed
-`THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which describe live CI flakes — and the
-ninth is about the *local* suite, so read it before trusting a green local run.
+history, **with seven exceptions that are current**: the sections headed `THE FOURTH MECHANISM`
+through `THE TENTH MECHANISM`, which describe live CI flakes — the ninth is about the *local*
+suite, so read it before trusting a green local run, and the tenth (added 2026-08-20) is why
+`main` is red right now.
 
 ---
 
@@ -63,10 +64,18 @@ same command, so read it before trusting any green local run, including these.
 as being at `be19551`'s *parent*. It was green at `be19551` itself: `gh api .../commits/be19551/
 check-runs` returned `gate`, `rust`, `contracts` and `changes` all `success` with `engine`
 `skipped`, and `gh pr view 87` reported `mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`, not a
-draft, immediately before the merge. On `main` at the merge commit `7e84646`, `rust` — which is
-exactly `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and
-`cargo test --workspace`, per `.github/workflows/ci.yml:51-57` — completed **success**, as did
-`contracts` and `changes`. Note `engine` is `skipped` on a PR and actually runs on `main`.
+draft, immediately before the merge. Note `engine` is `skipped` on a PR and actually runs on
+`main` — so a PR being green says nothing about that tier.
+
+**`main` IS RED AT THE MERGE COMMIT, AND IT IS NOT THE MERGE. READ `THE TENTH MECHANISM` BEFORE
+DIAGNOSING IT.** At `7e84646`, `rust` — exactly `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`, per
+`.github/workflows/ci.yml:51-57`, and the only job that covers the merged Rust — completed
+**success**, as did `contracts` and `changes`. `engine` **failed**, and `gate` failed because it
+depends on `engine`. The failure is a Swift test inside the *pinned Arca engine*, on source the
+merge cannot reach: `git diff 61f1b3c 7e84646 -- engine/ scripts/ .github/` is empty and
+`engine/arca-pin.json` reads the same revision at both commits. `main` has also been red on
+eleven of its last twelve runs, since before this branch existed.
 
 **A FRESH INSTANCE OF THE TRAP IN POINT 1 BELOW, worth having before you diagnose anything red.**
 `main`'s tip immediately before this merge, `61f1b3c`, has a **red** CI run — `gate`, `rust` and
@@ -77,12 +86,12 @@ alone. Run `git diff --name-only` before you spend an hour on a red run.
 **THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
 and the maintainer chooses from it:
 
-1. **The six unfixed flake mechanisms this file names** — the empty pid-file read, the
+1. **The seven unfixed flake mechanisms this file names** — the empty pid-file read, the
    `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
    collision, a `lifecycle` container left `Running` after a rejected `up`, and a 250ms
    wall-clock bound in `gascan-e2e`'s PTY signal test, and four flaky tests in `gascan --lib`
-   itself. All six are written up under the headings
-   `THE FOURTH MECHANISM` through `THE NINTH MECHANISM`, which sit *below* the
+   itself, and a Swift test in the pinned Arca engine that is why `main` is red today. All seven
+   are written up under the headings `THE FOURTH MECHANISM` through `THE TENTH MECHANISM`, which sit *below* the
    `Where the work is` heading despite being current. **Two of them are different tests in the
    same `lifecycle` target**, so "the `lifecycle` flake" is not one thing — and **the eighth is
    the only one whose fix does not require diagnosing a race first**, because its pass condition
@@ -3170,6 +3179,38 @@ syscall. Do not write down a cause for it; nobody has one.
 shape, same class as the eighth: it gives `start_with` `readiness: 200ms` with `poll: 1ms`, so a
 loaded machine misses the budget. Like the eighth, its fix is a design call rather than a race
 hunt.
+
+**THE TENTH MECHANISM, FOUND 2026-08-20: a Swift test in the *pinned Arca engine* reads an
+async counter with no bounded wait.** `engine` failed on `main` at the merge commit `7e84646`,
+and `gate` failed with it because it depends on `engine`. **It is not the merge.** The failure is
+`ExecTeardownTests.testAResetBeforeTheProcessStartsStillKillsTheGuest`, at
+`.artifacts/arca-engine/arca/Tests/ArcaEngineTests/ExecTeardownTests.swift:357` —
+`XCTAssertEqual(reaps, 1, "the exec instance must be reaped, once")`, observed `0`. 253 tests, 1
+failure, step exit code 1.
+
+**Exonerated by diff AND by identity, not by probability.** `git diff --name-only 61f1b3c 7e84646`
+is five Rust files under `crates/` and five docs — **zero Swift**. `git diff 61f1b3c 7e84646 --
+engine/ scripts/ .github/` is **empty**, and `engine/arca-pin.json` reads
+`c545612b056e028d5885968a7b9f586d694f994c` at *both* commits. The pinned Swift source compiled and
+tested at `7e84646` is therefore bit-identical to what ran before it. That same source **passed**
+this test at `c721b3fa`, `d5bb48a1`, `a3fef906` and `3cf98b5b` — each of those `engine` jobs got
+past the Swift step and failed later at the Rust live tier with exit **101**, a different failure
+entirely. Identical input, different outcome, so it is non-deterministic by construction.
+
+**The shape is visible in the source, and it is the eighth's class.** The two assertions
+immediately above the failing one both wait — `await Self.holds(within: .seconds(20)) { ... }` —
+while `let reaps = await guest.reaps` is read straight through with no wait at all. The reap is
+asynchronous to the kill that triggers it, so the pass condition is that it landed before the next
+statement executed. Like the eighth and like
+`start_readiness_waits_for_its_own_connected_publication_to_finish`, **the fix is a design call
+rather than a race hunt** — and unlike either, the fix belongs in the Arca repository, not this
+one, because the file is under the pinned engine checkout.
+
+**`main` HAS NOT BEEN GREEN SINCE AT LEAST 2026-08-16.** `gh run list --branch main --workflow ci
+--limit 12` returns `failure` for eleven of the last twelve runs and `cancelled` for the twelfth.
+Do not read a red `main` as a signal that the last merge broke something; check `rust` on its own
+first. At `7e84646`, `rust` — the job that actually covers merged Rust — was **success**, as were
+`contracts` and `changes`.
 
 **Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
 'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
