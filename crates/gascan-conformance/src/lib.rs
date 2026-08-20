@@ -109,10 +109,26 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
     // silent re-create. Each backend detects this its own way -- the fake by
     // map lookup, apple by pre-flight inventory scan, arca engine-side -- so the
     // stable code is the only portable thing to assert.
-    assert_eq!(
-        backend.create(fixture.request()).await.unwrap_err().code(),
-        "resource_conflict"
-    );
+    let conflict = backend.create(fixture.request()).await.unwrap_err();
+    assert_eq!(conflict.code(), "resource_conflict");
+    // Cleanup, not a claim. A rejected `create` may still have built resources
+    // before it hit the collision, and the `remove` at the end of this walk
+    // knows only about the first create's. Nothing is asserted about what the
+    // list holds: `is_empty()` would be a portability claim, and arca's own live
+    // suite predicts arca would fail it.
+    //
+    // No-op on every backend today -- the fake's map lookup
+    // (`gascan-core/src/fake_runtime.rs:695`) and apple's pre-flight inventory
+    // scan (`gascan-apple/src/backend.rs:238-252`) both fire before a single
+    // resource is made, and arca does not reach this line. It is here for live
+    // engines, where a conflicting create has been measured reporting the three
+    // volumes it had made (`gascan-arca/tests/live/lifecycle.rs:275-283`).
+    if !conflict.created().is_empty() {
+        backend
+            .remove(RemoveRequest::from_resources(conflict.created().to_vec()).unwrap())
+            .await
+            .unwrap();
+    }
     // Doubled deliberately: `start` and `stop` are idempotent, so the second
     // call of each must succeed and not report the sandbox's current state as
     // an error. Collapsing either pair deletes the assertion.
