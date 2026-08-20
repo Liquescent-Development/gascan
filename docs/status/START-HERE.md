@@ -6,9 +6,9 @@ addressed to you, the agent. Follow it as instructions — there is nothing to p
 Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day after the daemon
 instance record's publish race was fixed and merged (PR #80, #81). Updated again 2026-08-19,
 from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
-retryable verdict — was implemented there and opened as PR #87. **Updated 2026-08-20: PR #87 IS
-MERGED, open item 1 is closed entire, and the queue in the block below is now the whole
-assignment.** Everything above the `Where the work is` heading is current; everything below it is
+retryable verdict — was implemented there and opened as PR #87. **Updated 2026-08-20: PR #87 is
+merged, open item 1 is closed entire, and the assignment is now P5.3 — the backend conformance
+suite, specced and planned in the block below and not started.** Everything above the `Where the work is` heading is current; everything below it is
 history, **with seven exceptions that are current**: the sections headed `THE FOURTH MECHANISM`
 through `THE TENTH MECHANISM`, which describe live CI flakes — the ninth is about the *local*
 suite, so read it before trusting a green local run, and the tenth (added 2026-08-20) is why
@@ -18,8 +18,35 @@ suite, so read it before trusting a green local run, and the tenth (added 2026-0
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**PR #87 IS MERGED. OPEN ITEM 1 IS CLOSED ENTIRE, PRODUCER AND READER. THE QUEUE BELOW IS THE
-WHOLE ASSIGNMENT — there is nothing left to decide about the reader half.** Merged 2026-08-20 as
+**THE ASSIGNMENT IS P5.3, THE BACKEND CONFORMANCE SUITE. IT IS SPECCED, PLANNED, AND NOT STARTED.**
+Chosen by the maintainer on 2026-08-20 after PR #87 merged, on the instruction to follow roadmap
+order. Read these two, in this order, and nothing else is needed to begin:
+
+| | |
+|---|---|
+| Design | `docs/superpowers/specs/2026-08-20-backend-conformance-suite-design.md` |
+| Plan | `docs/superpowers/plans/2026-08-20-backend-conformance-suite.md` — eight tasks, execute with `superpowers:subagent-driven-development` |
+
+**The one thing that will mislead you if you skip the design.** The roadmap says *"extract the
+conformance suite from `fake_runtime.rs`"*, which reads as though a suite must be written. It must
+not. `crates/gascan-core/tests/backend_contract.rs:149` is **already**
+`pub async fn backend_contract(backend: &dyn RuntimeBackend)`. It cannot be reached from
+`gascan-apple` or `gascan-arca` because it lives in a `tests/` target, which is not a library —
+which is why `crates/gascan-apple/tests/live/backend_contract.rs` hand-rolls 65 lines over the same
+ground. The task is relocation and instantiation, not authorship.
+
+**The measurement the whole task exists for is Task 5 step 6: run the contract against arca for the
+first time.** The plan deliberately writes no expected result for it. If arca fails, the deliverable
+is the failing test committed with the failure quoted — **not** a weakened assertion. That is
+acceptance criterion 8 in the design, and it is the one that will be under pressure.
+
+**What is NOT in it, so nobody widens it mid-flight:** the product-level `gascan-e2e`-on-arca work
+(P5's *second* exit clause), P5.4/U5, and anything about offline. Each is named under the design's
+"Out of scope" with a reason.
+
+---
+
+**PR #87 IS MERGED. OPEN ITEM 1 IS CLOSED ENTIRE, PRODUCER AND READER.** Merged 2026-08-20 as
 a true merge commit, not a squash: `7e84646`, parents `61f1b3c` (main) + `be19551` (branch),
 per `git log origin/main -2 --format='%h %p %s'`. All 35 commits survive
 (`git rev-list --count 61f1b3c..7e84646` → 35), and `git merge-base --is-ancestor` confirms
@@ -83,8 +110,8 @@ eleven of its last twelve runs, since before this branch existed.
 insertions, markdown**. There is no code in it. A red `rust` there is a flake, exonerated by diff
 alone. Run `git diff --name-only` before you spend an hour on a red run.
 
-**THE QUEUE BELOW IS THE ASSIGNMENT.** It is a queue, not a menu,
-and the maintainer chooses from it:
+**THE QUEUE BELOW IS WHAT COMES AFTER P5.3, NOT INSTEAD OF IT.** It is a queue, not a menu, and
+the maintainer chooses from it once the conformance suite is done:
 
 1. **The seven unfixed flake mechanisms this file names** — the empty pid-file read, the
    `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
