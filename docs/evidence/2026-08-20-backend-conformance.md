@@ -10,12 +10,25 @@ test double satisfies the contract's assertion.**
 | apple | `Running` | `create` translates to `container run` — `crates/gascan-apple/src/translate.rs:100`, inside the `create` opening at `:94` |
 | arca | `Creating` | the pinned engine maps container status `"created"` → `.creating` |
 
-Both real backends fail at `crates/gascan-conformance/src/lib.rs:104`, the
-walk's third assertion, reached after `inspect`-absent and `create`.
-**Everything after it — the duplicate
-`create`, the doubled `start`, the exec session, the doubled `stop`, `remove`,
-and the final absent `inspect` — was NOT REACHED on either backend.** Nobody may
-write that apple or arca passed or failed the exec walk. It was not run.
+Both real backends fail at the post-`create` state assertion in
+`crates/gascan-conformance/src/lib.rs` — the walk's third assertion, reached
+after `inspect`-absent and `create`. **It is at `:139` as this document is
+written; the panics quoted below say `:104`, which is where it sat when they
+were taken, and the explanatory comment added over it afterwards moved it down.
+The panic text is left as measured. Re-derive the line; do not trust either
+number.**
+
+**Everything after that assertion — the duplicate `create`, the doubled `start`,
+the exec session, the doubled `stop`, `remove`, and the final absent `inspect` —
+was NOT REACHED on either backend.** Nor was apple's own tail: the
+`list_resources` assertion at
+`crates/gascan-apple/tests/live/backend_contract.rs:37-44`, which checks that no
+resource named for the run survives, is downstream of the panic and did not
+execute either. **Do not confuse it with the residue check
+recorded further down this document, which was run by hand against the
+`container` CLI afterwards and is a different instrument measuring a narrower
+property.** Nobody may write that apple or arca passed or failed the exec walk,
+or that apple's own residue assertion passed. None of it was run.
 
 This document is what P5.3's acceptance criterion 8 required: arca's result is a
 *finding*, not a pass criterion. The deliverable is the measurement, and the
@@ -26,7 +39,7 @@ weakened to produce a green tier.**
 
 | | |
 |---|---|
-| Gas Can revision | branch `feat/backend-conformance-suite`. The eleven commits under "How this branch got here" are the work; the commit that adds this document sits on top of them, at `ba458c9`'s child. Re-derive with `git log --oneline main..feat/backend-conformance-suite`. |
+| Gas Can revision | branch `feat/backend-conformance-suite`. The commits under "How this branch got here" are the work; this document and the review fixes sit on top of them. Re-derive the full list with `git log --oneline main..feat/backend-conformance-suite` rather than counting from here. |
 | Contract | `crates/gascan-conformance/src/lib.rs`, `pub async fn backend_contract(&dyn RuntimeBackend, &CreateRequestFixture)` |
 | Instantiations | `crates/gascan-conformance/tests/fake.rs`, `crates/gascan-apple/tests/live/backend_contract.rs`, `crates/gascan-arca/tests/live/conformance.rs` |
 | Host | `newcombe`, Darwin 25.6.0 arm64 |
@@ -145,13 +158,17 @@ in effect, and the design has been corrected as part of this work.
   `backend_contract_holds_on_arca` calls `base_oci_layout()`
   (`crates/gascan-arca/tests/live/common/mod.rs:156-159`), whose absence is a
   `panic!` and never a skip — deliberately, per the rule at `:137-140`. The
-  step's own comment records, as a measurement at this revision, that 20 of the
-  25 tests `--ignored` selects fail in 0.00s on exactly that missing variable,
-  and have done so since milestone 2. **The new test can only join them.** That
-  is a derivation from the panic-not-skip rule and the step's recorded
-  measurement; no CI run of this test has been observed.
-- **Apple.** No CI job runs its tier at all. `--ignored` appears in exactly one
-  place in `.github/workflows/ci.yml` — line 178, arca's step.
+  step's own comment records, as a measurement, that 20 of the 25 tests
+  `--ignored` selects fail in 0.00s on exactly that missing variable, and have
+  done so since milestone 2. **That 25 is from an earlier revision.** Re-derived
+  at this one: `grep -rc '#\[ignore' crates/gascan-arca/tests/live/*.rs`, summed,
+  is **29**, one of them added by this branch — which is also why the arca run
+  below reports 28 filtered out beside its 1 failure. **The new test can only
+  join the failing majority.** That is a derivation from the panic-not-skip rule
+  and the step's recorded measurement; no CI run of this test has been observed.
+- **Apple.** No CI job runs its tier at all. `--ignored` appears three times in
+  `.github/workflows/ci.yml` — `:139` and `:162`, both inside comments, and
+  `:178`, arca's step, **the only executed one**.
 
 **So both real-backend measurements are local-only, on a named machine, on a
 named date, and this document is the only evidence for them that will ever
@@ -178,13 +195,22 @@ Grepping all three for the failed run's container,
 `gascan-live-backend-*` resource survives. The remaining entries all belong to
 the user's own `code` sandbox and to the containerization build image.
 
+**`0e1f3fb`'s commit message claims more than this, and it is the second
+uncorrected claim on the branch.** It says the three `container …` listings
+"afterwards match their pre-run output" — **no pre-run listing was ever
+captured**, so that comparison was never available to make. What was measured is
+the narrower property above, and only afterwards: that nothing named for the run
+survives. That is enough to say the run left no residue; it is not enough to say
+the host is in the state it started in. Unlike `049b4ba`'s two claims, this one
+has no correcting commit, which is why the correction is here.
+
 ## An open question this branch surfaced and deliberately did not answer
 
 **What a *same-request* duplicate `create` reports in `created()` is unmeasured
 on every backend.**
 
 The contract's walk issues its second `create` with the same request as the
-first (`crates/gascan-conformance/src/lib.rs:97` and `:112`) and asserts only
+first (`crates/gascan-conformance/src/lib.rs:117` and `:147`) and asserts only
 that the failure's code is `resource_conflict`. `conflict.created()` is neither
 inspected nor removed, and the reason is recorded in the contract itself: a
 rejected `create` may report resources it built before the collision, but with
@@ -228,7 +254,7 @@ whole**, **one promoted in part**, and **five promoted nothing**.
 to the estimate, and §3 of the design now carries the measured outcome in place
 of the estimate, with the reason each of the five non-promoting candidates was
 left where it is. Every promoted assertion is exercised by `FakeRuntime` alone
-today, because all four sit *after* `lib.rs:104`.
+today, because all four sit *after* the post-`create` state assertion.
 
 ## Two claims corrected
 
@@ -258,6 +284,10 @@ text, so it is repeated here:
 | `e7e55e4` | **reversed** that cleanup — it would have torn down the sandbox under test |
 | `a32a29e` | promoted 1 assertion |
 | `ba458c9` | design §3 updated with the measured triage outcome |
+| `99f1449` | this document, `START-HERE` item 10, and the design §6 correction below |
+
+The final whole-branch review's fixes land after `99f1449` — comment-only, no
+assertion touched. They are why the assertion's line number moved off `104`.
 
 ## What this does not say
 
@@ -282,8 +312,9 @@ text, so it is repeated here:
 ## What follows
 
 1. **The two failures stay in the tree asserting the contract as written.** They
-   fail today, on a real backend, for a real reason. Weakening `lib.rs:104` to
-   accept three states would make the suite green and would make it worthless —
+   fail today, on a real backend, for a real reason. Weakening the post-`create`
+   state assertion to accept three states would make the suite green and would
+   make it worthless —
    that is the outcome acceptance criterion 8 exists to forbid.
 2. **Deciding what a backend owes after `create` is the next piece of work**, and
    it is a design decision with three live candidates in front of it. It is not

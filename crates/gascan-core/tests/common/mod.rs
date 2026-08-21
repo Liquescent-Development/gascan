@@ -5,6 +5,16 @@ use gascan_core::runtime::{CreateRequest, NetworkIsolation, RuntimeCapabilities,
 use gascan_core::sandbox::SandboxSpec;
 use std::ops::Deref;
 
+/// A compiled `CreateRequest` and the temporary root it was compiled from.
+///
+/// **A near-copy of this fixture lives at `gascan-conformance/src/lib.rs`, and
+/// the duplication is deliberate and permanent** -- see the design's §2
+/// (`docs/superpowers/specs/2026-08-20-backend-conformance-suite-design.md`).
+/// Pointing this target at `gascan-conformance` would mint a `gascan-core`
+/// dev-dependency on a crate that depends on `gascan-core`. The copies have
+/// already diverged on `capabilities().version` -- `(1, 0, 0)` here against
+/// `(1, 1, 0)` there -- which the conformance copy's own comment argues is
+/// inert. Do not let anything else diverge without making that argument again.
 pub struct CreateRequestFixture {
     _root: tempfile::TempDir,
     request: CreateRequest,

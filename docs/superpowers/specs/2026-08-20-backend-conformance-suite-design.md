@@ -125,7 +125,8 @@ nothing. Both countings are below the estimate, and nothing was promoted to clos
 | Task 7 | from `exec_session_is_live_bidirectional_and_emits_one_exit`: the exec stream ends at the terminal `Exit`. The rest of that test is fake-only and stays, renamed `exec_session_echoes_stdin_and_maps_a_signal_to_its_exit_code` so the name matches the assertions left in it. |
 
 **Every promoted assertion is exercised by `FakeRuntime` alone today.** Apple and arca both fail the
-contract at the post-`create` state assertion (`crates/gascan-conformance/src/lib.rs:104`) — apple
+contract at the post-`create` state assertion (`crates/gascan-conformance/src/lib.rs:139`, `:104`
+in the recorded panic text — the comment now over it moved the line) — apple
 reports `Running`, arca `Creating` — which precedes every line promoted, so neither backend has
 been measured against any of it.
 
@@ -135,7 +136,7 @@ been measured against any of it.
 |---|---|
 | `exec_and_logs_preserve_binary_bytes_and_exact_exit_code` | `set_exec_result` and `set_logs`, both fake-only. Asserting the property portably needs a command that emits known bytes on stdout *and* stderr and exits non-zero; the fake's vocabulary for that is `fake-stdout` / `fake-stderr` / `fake-exit` (`crates/gascan-core/src/fake_runtime.rs:588-636`), which no container image has, and the fake maps the portable spelling to nothing at all — `Some("true") \| Some("sh") => (Vec::new(), Vec::new(), 0)` at `:633`. Giving the contract a per-backend command means parameterising it, a design change. The exit code the walk *can* portably assert is already asserted. The log half is worse than unportable: `since` is not the same quantity across backends — apple passes `--since {n}ms` to the CLI, a duration ago (`crates/gascan-apple/src/backend.rs:630-632`), arca sends `since_unix_millis`, an absolute instant (`crates/gascan-arca/src/backend.rs:411-414`). |
 | `exec_session_is_live_bidirectional_and_emits_one_exit` | **Promoted in part**, see above. What stays needs `fake-echo-stdin` to get stdin back, and its `Exit { code: 143, signal: 15 }` is the fake's own `128 + signal` arithmetic (`crates/gascan-core/src/fake_runtime.rs:1118-1122`), not something a backend owes. |
-| `create_collision_reports_resources_created_before_the_collision` | `seed_volume`, fake-only. The assertion's entire content is that a failure reports exactly the resources built before a **planted** collision at a chosen index. Creating twice does produce a collision on a real backend, but with the same request — so the reported names would be the live sandbox's own, and what a same-request collision reports is unmeasured on every backend. `crates/gascan-conformance/src/lib.rs:114-123` records that open question in the contract itself. |
+| `create_collision_reports_resources_created_before_the_collision` | `seed_volume`, fake-only. The assertion's entire content is that a failure reports exactly the resources built before a **planted** collision at a chosen index. Creating twice does produce a collision on a real backend, but with the same request — so the reported names would be the live sandbox's own, and what a same-request collision reports is unmeasured on every backend. `crates/gascan-conformance/src/lib.rs:149-164` records that open question in the contract itself, and names `gascan-apple/tests/live/storage.rs:22-37` as the precedent not to copy. |
 | `offline_fake_create_has_no_managed_network` | Not machinery — fixture shape. The contract is one walk over one fixture, and arca's must be `network = 'networked'`: offline is the capability the pinned engine is proven not to honour (`docs/evidence/2026-08-18-arca-engine-offline.md`). An unconditional "no managed network" assertion fails for a networked fixture on *every* backend, so promoting it needs the contract to branch on the fixture's network. That is a design change, and it is not made here. |
 | `networked_fake_create_reports_network_then_volumes_then_container` | Same fixture-conditionality — the network element exists only for a networked fixture — and, separately, **nothing owes the ordering**. `RemoveRequest::from_resources` does not reorder (`crates/gascan-core/src/runtime.rs:1001-1017`), yet the fake's recorded removal comes out container / volume / network, so re-ordering is the backend's job and no consumer reads `created()` positionally. Arca's list is in whatever order the engine's `CreateResponse` carried (`crates/gascan-arca/src/backend.rs:80-108`) — an unmeasured property of a pinned external binary. **Correction to the plan's candidate table**, which says this ordering "is asserted through the fake's call recorder": it is not. The test reads `outcome.created()` (`crates/gascan-core/tests/backend_contract.rs:509-517`) and touches neither `calls()` nor `outcomes()`. The verdict is unchanged; the stated reason was wrong. |
 | `persistent_logs_are_isolated_by_exact_sandbox_id` | `FakeRuntime::persistent`, named fake-only machinery, plus `fake-stdout` to get a marker into the log. Isolation-by-id also needs two live sandboxes and `backend_contract` takes one fixture, so promoting it would mean a second design change on top of the machinery. |
@@ -231,10 +232,13 @@ instantiation does land in the live tier CI executes
 the tier needs four. `backend_contract_holds_on_arca` calls `base_oci_layout()`, whose absence is a
 `panic!` and never a skip, and the step's own comment records as a measurement that 20 of the 25
 tests `--ignored` selects fail in 0.00s on exactly that missing variable and have done so since
-milestone 2 — so the new test can only join them. That is a derivation, not an observed CI run.
-The **apple** instantiation runs **nowhere in CI**; no workflow step
-passes `--ignored` for `gascan-apple` or `gascan-e2e`, and line 178 is the only `--ignored` in the
-file. Both real-backend results are therefore local-only, and no claim that a real backend passes or
+milestone 2 — so the new test can only join the failing majority. That is a derivation, not an
+observed CI run. **That `25` is from an earlier revision**: re-derived at HEAD,
+`grep -rc '#\[ignore' crates/gascan-arca/tests/live/*.rs` sums to **29**, one of them added by this
+plan. The **apple** instantiation runs **nowhere in CI**; no workflow step
+passes `--ignored` for `gascan-apple` or `gascan-e2e`, and of the three `--ignored` occurrences in
+`.github/workflows/ci.yml` — `:139` and `:162` inside comments, `:178` in arca's step — only `:178`
+is executed. Both real-backend results are therefore local-only, and no claim that a real backend passes or
 fails conformance should be made without naming the machine and the date. What CI *does* hold is
 that the tests are still wired in, via `scripts/ci-check-ignored-tests.sh`; that is existence, not
 execution. `docs/evidence/2026-08-20-backend-conformance.md` is where the local measurements live.

@@ -3,6 +3,12 @@
 //! This crate exists because `gascan-core/src/lib.rs:2` denies
 //! `clippy::unwrap_used`, and a conformance suite is built from unwrapping
 //! assertions. It is a dev-dependency of its consumers and ships nowhere.
+//!
+//! **What it measures today: `FakeRuntime` satisfies the contract and the two
+//! real backends do not.** Both fail at the post-`create` state assertion in
+//! [`backend_contract`], which carries the detail. That is the recorded
+//! deliverable of P5.3, not an outstanding bug --
+//! `docs/evidence/2026-08-20-backend-conformance.md`.
 
 use camino::Utf8Path;
 use gascan_core::manifest::Manifest;
@@ -14,6 +20,20 @@ use gascan_core::runtime::{
 use gascan_core::sandbox::SandboxSpec;
 use std::ops::Deref;
 
+/// A compiled `CreateRequest` and the temporary root it was compiled from.
+///
+/// **A near-copy of this fixture lives at `gascan-core/tests/common/mod.rs`, and
+/// the duplication is deliberate and permanent** -- see the design's §2
+/// (`docs/superpowers/specs/2026-08-20-backend-conformance-suite-design.md`).
+/// Pointing `gascan-core/tests` at this crate would mint a `gascan-core`
+/// dev-dependency on a crate that depends on `gascan-core`. The copies have
+/// already diverged on `capabilities().version` -- `(1, 1, 0)` here against
+/// `(1, 0, 0)` there. That is inert by a two-step argument, so it is written
+/// down rather than left to be re-derived: the field is read in exactly two
+/// places, `gascan-core/src/policy.rs:422` constructing
+/// `PolicyError::OfflineUnsupported` and `:561-563` formatting it, and both are
+/// reachable only through `NetworkIsolation::Unsupported`, which neither copy
+/// sets. Anything else that diverges needs its own such argument.
 pub struct CreateRequestFixture {
     _root: tempfile::TempDir,
     request: CreateRequest,
@@ -101,6 +121,21 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
             .iter()
             .any(|resource| resource.kind() == ResourceKind::Container)
     );
+    // **TWO OF THE THREE BACKENDS FAIL HERE, AND THAT IS A RECORDED FINDING, NOT
+    // A BUG IN THIS ASSERTION.** MEASURED on `newcombe` 2026-08-20: apple
+    // reports `Running` (its `create` compiles to `container run`,
+    // `gascan-apple/src/translate.rs:100`) and arca reports `Creating` (the
+    // pinned engine maps status "created" -> `.creating`). Only `FakeRuntime`
+    // reports `Stopped`. Both failures, with their commands, exit codes and the
+    // positive control, are in `docs/evidence/2026-08-20-backend-conformance.md`.
+    // Those two panics name `lib.rs:104:5`, which is where this `assert_eq!` sat
+    // when they were taken; adding this comment moved it down. The quoted panic
+    // text is left as measured -- it is an observation, not a pointer.
+    //
+    // **Do not widen this to accept three states.** The design's acceptance
+    // criterion 8 names that as the one outcome that makes the whole exercise
+    // worthless. Deciding what a backend owes after `create` is separate work --
+    // `docs/status/START-HERE.md` open item 10.
     assert_eq!(
         backend.inspect(&id).await.unwrap().unwrap().state,
         ContainerState::Stopped
@@ -121,6 +156,12 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
     // there the container and volumes had been removed first and only the
     // network name was still held, so its three volumes were genuinely
     // orphaned. What a same-request collision reports is unmeasured everywhere.
+    //
+    // **The precedent a reader will find is `gascan-apple/tests/live/storage.rs`
+    // `create_with_partial_cleanup` (`:22-37`), and it must not be copied here.**
+    // It is correct where it is -- its callers hand it creates expected to fail
+    // against independently-seeded state, so what those failures report really
+    // is orphaned. Here the collision is a duplicate of the live sandbox.
 
     // Doubled deliberately: `start` and `stop` are idempotent, so the second
     // call of each must succeed and not report the sandbox's current state as
@@ -146,6 +187,7 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
     // so the sender drops (`gascan-apple/src/backend.rs:614`), arca by the same
     // break over engine frames (`gascan-arca/src/backend.rs:387`).
     assert!(session.next().await.is_none());
+    // Doubled deliberately -- the `stop` half of the idempotence pair above.
     backend.stop(&id).await.unwrap();
     backend.stop(&id).await.unwrap();
     backend

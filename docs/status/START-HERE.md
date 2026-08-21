@@ -29,9 +29,11 @@ fact as written here.
 STATE AFTER `create`, AND ONLY THE TEST DOUBLE SATISFIES THE CONTRACT.** `FakeRuntime` reports
 `Stopped`, apple reports `Running` (its `create` compiles to `container run`), arca reports
 `Creating` (the pinned engine maps status `"created"` → `.creating`). Apple and arca both panic at
-`crates/gascan-conformance/src/lib.rs:104`, the walk's third assertion — so **`start`, `exec`,
-`stop`, `remove` and the closing absent `inspect` were NOT REACHED on either real backend. Do not
-write that apple or arca passed or failed the exec walk; it was not run.**
+the post-`create` state assertion in `crates/gascan-conformance/src/lib.rs` — the walk's third,
+`:139` today and `:104` in the recorded panic text, because the comment now standing over it moved
+it. **`start`, `exec`, `stop`, `remove`, the closing absent `inspect`, and apple's own
+`list_resources` tail were NOT REACHED on either real backend. Do not write that apple or arca
+passed or failed the exec walk; it was not run.**
 
 | | |
 |---|---|
@@ -40,16 +42,18 @@ write that apple or arca passed or failed the exec walk; it was not run.**
 | Plan | `docs/superpowers/plans/2026-08-20-backend-conformance-suite.md` — the eight tasks as executed |
 
 **Do not "fix" this by editing the assertion.** Acceptance criterion 8 says arca's result is a
-finding, not a pass criterion; forcing green by widening `lib.rs:104` to accept three states is the
-one outcome that makes the suite worthless. Deciding what a backend owes after `create` is separate
-work and is open item 10.
+finding, not a pass criterion; forcing green by widening that assertion to accept three states is
+the one outcome that makes the suite worthless. Deciding what a backend owes after `create` is
+separate work and is open item 10. **The assertion now carries a comment saying all of this**, so
+a reader arriving from a panic message is not left to guess.
 
 **NEITHER REAL-BACKEND MEASUREMENT IS REPRODUCIBLE IN CI, and the design used to claim otherwise.**
 CI's live-tier step sets one variable and the tier needs four. `backend_contract_holds_on_arca`
 calls `base_oci_layout()`, whose absence is a `panic!` and never a skip, so it can only join the
 ~20 live tests the step's own comment records as failing in 0.00s on that missing variable since
 milestone 2 — that is the derivation, not an observed CI run. Apple's tier runs in **no** CI job at
-all; line 178 of `.github/workflows/ci.yml` is the file's only `--ignored`. Both results are
+all; `.github/workflows/ci.yml` mentions `--ignored` three times and `:178`, arca's step, is the
+only **executed** one. Both results are
 local-only, from `newcombe` on 2026-08-20, and the evidence document is the only record of them
 that will ever exist. `scripts/ci-check-ignored-tests.sh` proves the tests still exist; it proves
 nothing about their having run.
@@ -699,8 +703,9 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    grounds that a literal in a test outside the implementing crates is the external contract
    rather than a copy. Both judgements were merged on the maintainer's standing merge-on-green
    authorization without a separate review round, and both remain reversible.
-10. **APPLE AND ARCA BOTH FAIL THE BACKEND CONTRACT AT
-    `crates/gascan-conformance/src/lib.rs:104`, AND NOBODY HAS DECIDED WHAT THE RIGHT ANSWER IS.**
+10. **APPLE AND ARCA BOTH FAIL THE BACKEND CONTRACT AT ITS POST-`create` STATE ASSERTION
+    (`crates/gascan-conformance/src/lib.rs`, `:139` today, `:104` in the recorded panic text — the
+    comment now over it moved the line), AND NOBODY HAS DECIDED WHAT THE RIGHT ANSWER IS.**
     Opened 2026-08-20 by P5.3. The assertion is
     `assert_eq!(backend.inspect(&id).await.unwrap().unwrap().state, ContainerState::Stopped)`,
     immediately after `create`. **All three backends disagree**: `FakeRuntime` `Stopped`, apple
@@ -721,9 +726,17 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
 
     **What is open is a design decision, and it has three live candidates**: assert a set of
     acceptable post-`create` states, make the expected state a fixture-declared fact, or change a
-    backend. **Do not close it by widening `lib.rs:104` to accept whatever the backends do** — that
-    is the outcome the design's acceptance criterion 8 exists to forbid. The two tests stay in the
-    tree failing, on the same principle as `network.rs`'s offline test.
+    backend. **Do not close it by widening that assertion to accept whatever the backends do** —
+    that is the outcome the design's acceptance criterion 8 exists to forbid. The two tests stay in
+    the tree failing, on the same principle as `network.rs`'s offline test, and both the assertion
+    and apple's test file now carry comments saying so.
+
+    **P5.3 did NOT take the `sandbox_id`-claim sharing** that the history below once assigned to it
+    (grep `Sharing it belongs to`), and that was right: it is a production change to
+    `gascan-arca/src/translate.rs` and
+    `gascan-apple/src/inspect.rs`, and the design's §5 excludes production changes wholesale — the
+    branch touches exactly one `/src/` file, the new conformance crate's own. It is unassigned work
+    now, not P5.3's residue.
 
     **Neither result can be reproduced by CI**, so re-measuring means a real Mac with the four
     `GASCAN_ARCA_*` variables, or `container` running for apple. The reason is in the evidence
@@ -3378,4 +3391,8 @@ engine.** Do not add a test double for it.
 
 The `sandbox_id`-claim rule is still duplicated verbatim between
 `gascan-arca/src/translate.rs` and `gascan-apple/src/inspect.rs`, each with its own test and
-a comment warning they must not diverge. Sharing it belongs to P5.3.
+a comment warning they must not diverge. ~~Sharing it belongs to P5.3.~~ **P5.3 did not take it,
+deliberately: it is a production change and the design's §5 excludes those wholesale — the whole
+branch touches one `/src/` file, `git diff --name-only main...feat/backend-conformance-suite | grep
+"/src/"` returning only `crates/gascan-conformance/src/lib.rs`. It is unassigned now.** See open
+item 10.
