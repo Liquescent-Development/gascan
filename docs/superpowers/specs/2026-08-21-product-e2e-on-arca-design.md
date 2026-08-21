@@ -11,6 +11,22 @@ and existing `gascan-e2e`"*. P5.3 covered and measured the first clause and merg
 PR #90 (`fe27646`). The second — the product-level suite running on arca — was
 explicitly out of scope there (that design's §5) and is untouched.
 
+> **BLOCKED, 2026-08-21, after this design was written and committed at `578cd14`.**
+> §4 assumes the real workspace image can create a container on arca. **It cannot.**
+> The engine attaches one block device per OCI layer against a 26-letter alphabet, so
+> the 35-layer approved image fails at `create` with `no free indices are available for
+> allocation`. Measured, with the controlled experiment and mechanism, in §4.1 below.
+>
+> The maintainer's decision (2026-08-21): **revert arca to upstream Containerization's
+> single-composed-rootfs approach** rather than raising the ceiling or shrinking the
+> image. That is arca-side work in a separate repository and is a **prerequisite** to
+> everything else here. Scope is measured in §4.1; the handoff is
+> `docs/status/2026-08-21-arca-layer-ceiling-handoff.md`.
+>
+> **Everything outside §4 survives unchanged** — the measurements in §1, the structure
+> in §3, the backend proof in §5, the naming in §6, and the acceptance and failure
+> discipline in §7 are unaffected.
+
 ---
 
 ## 0. Why this exists, stated once and plainly
@@ -238,6 +254,78 @@ harness's ability to answer the second without answering the first is real, and 
 This is written here rather than left implicit so that the roadmap is not silently
 treated as satisfied. If the maintainer disagrees, this design is what should change —
 not the roadmap quietly.
+
+---
+
+## 4.1. The layer ceiling that blocks §4, and the decision taken
+
+**The controlled experiment.** Same test, same binaries, gascan `899a29f`, arca pin
+`8fc1ca5`, host `newcombe` (`hostname -s`). One variable changed,
+`GASCAN_ARCA_BASE_OCI_LAYOUT`:
+
+| Base layout | `cargo test -p gascan-e2e --test arca_engine -- --ignored` |
+|---|---|
+| `/tmp/alpine-oci`, 1 layer | `2 passed; 0 failed ... finished in 6.44s` |
+| workspace image, 35 layers | `create failed with exit code None: no free indices are available for allocation` |
+
+**The mechanism, from the engine's own log:**
+`layer_devices_start=/dev/vdc layers=36 total_mounts=38 writable_device=/dev/vdb`.
+One block device per OCI layer, composed by OverlayFS inside the guest. The 36 is 35
+image layers plus one the fixture adds. `vda` is initfs and `vdb` the writable
+overlay, leaving **24** letters for layers. Tags come from
+`Array("abcdefghijklmnopqrstuvwxyz")`
+(`containerization/Sources/ContainerizationExtras/NetworkAddress+Allocator.swift:96-101`);
+exhausting it throws `AllocatorError.allocatorFull`, whose text is the message above
+(`AddressAllocator.swift:49-50`).
+
+**Unpacking is not the problem.** All 36 layers unpacked in 18.74s
+(`duration_seconds=18.74 layers=36`); the failure is at attachment.
+
+**This is fork-local design, not a regression.** `git grep` against `upstream/main` in
+the `containerization` submodule (`Vas-Solutus/arca-containerization`, upstream
+`apple/containerization`) returns no match for `OverlayFSUnpacker`,
+`ArcaBlockDeviceRole` or `ArcaLayerAttachment`; all are present at fork HEAD
+`6304122`. The 26-letter allocator is upstream's — upstream stays under it because
+`LinuxContainer` takes a single `rootfs: Mount` plus an optional writable upper, so
+layer count never reaches the allocator.
+
+**Why the fork's optimisation does not pay here.** Upstream caches one ext4 per
+*image* (`EXT4Unpacker` unpacks to a block path and refuses if one exists,
+`:152-153`). The fork caches one ext4 per *layer*, which wins when many derived
+images share base layers — a registry workload. Gas Can has one pinned workspace
+image, so cross-image layer sharing is worth nothing, and upstream's per-image cache
+delivers the same benefit while attaching 1 device instead of 36.
+
+**A second thing the revert fixes.** `PrepareImage` cannot materialise a rootfs
+today, and `arca/Sources/ArcaEngine/SandboxEngineService.swift:594-608` documents why:
+the unpacker is per-*container*, creating `upper`/`work` at a container path and
+incrementing a per-layer reference count, and its per-image half is private upstream.
+Upstream's per-image unpack is what `PrepareImage` would need to keep the promise the
+contract states.
+
+### Measured scope of the revert
+
+**Submodule `arca-containerization`** — host side, almost entirely additive:
+`OverlayFSUnpacker.swift` 441, `ArcaLayerAttachment.swift` 95,
+`ArcaBlockDeviceRole.swift` 73, `LayerUnpackFailure.swift` 44,
+`Formatter+Unpack.swift` 26 (≈679 new lines), plus `EXT4Unpacker.swift` 31 modified
+lines to revert. Guest side: `vminitd/Sources/VminitdCore/ArcaBoot.swift`, 312 lines
+and **absent upstream** (`git cat-file -e upstream/main:…` fails), 49 overlay
+references; `AgentCommand.swift` 18 references; `Server+GRPC.swift` 12.
+
+**Parent repo `arca`** — `Sources/ContainerBridge/ContainerManager.swift` carries 52
+references, but **34 sit in one block, `1231-1353`**, the create path; the remainder
+are scattered singles. `Sources/ContainerBridge/OverlayFS/` holds
+`OverlayFSMounter.swift` 227 (one external caller, `ContainerManager.swift:1266`,
+creating `writable.ext4`), `OverlayFSClient.swift` 197 and 525 lines of generated
+protobuf — and **`OverlayFSClient` has no external references at all**, so ~722 of
+those lines appear already dead.
+
+Roughly **2,200 lines** of fork-local code across two repositories and both sides of
+the VM boundary. Most of it is deletion rather than rewriting, because upstream
+supplies the replacement. The fork is **70 commits ahead of upstream and 0 behind**
+(`git rev-list --count`), so this is the cheapest moment to do it — there is no
+upstream backlog to reconcile first.
 
 ---
 
