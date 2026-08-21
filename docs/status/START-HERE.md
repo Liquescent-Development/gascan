@@ -8,22 +8,65 @@ instance record's publish race was fixed and merged (PR #80, #81). Updated again
 from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
 retryable verdict — was implemented there and opened as PR #87. **Updated 2026-08-20: PR #87 is
 merged, open item 1 is closed entire, and P5.3 — the backend conformance suite — has been
-EXECUTED on branch `feat/backend-conformance-suite`, all eight tasks, and it found two backends
-failing the contract. See the block below and open item 10.** Everything above the `Where the work is` heading is current; everything below it is
+EXECUTED, all eight tasks, and it found two backends failing the contract.** **Updated 2026-08-21:
+P5.3 IS MERGED as PR #90, and the maintainer has DEFERRED CI — see the block below and open item
+10.** Everything above the `Where the work is` heading is current; everything below it is
 history, **with seven exceptions that are current**: the sections headed `THE FOURTH MECHANISM`
 through `THE TENTH MECHANISM`, which describe live CI flakes — the ninth is about the *local*
-suite, so read it before trusting a green local run, and the tenth (added 2026-08-20) is why
-`main` is red right now.
+suite, so read it before trusting a green local run, and the tenth (added 2026-08-20) is one of two
+reasons `main` goes red. **Corrected 2026-08-21:** the tenth is *flaky, not constant* — PR #90's
+run 32437752256 passed the Swift step that is red on `main` and then failed at the live-tier step
+instead, which is the environment (three of four `GASCAN_ARCA_*` variables absent) and not a test.
+So a red `engine` can be either, and you must read which step failed before diagnosing. `main`'s
+run at the merge `fe27646` was still in progress when this was written — `gh run list --branch main`
+rather than trusting that. None of it blocks anything: CI is deferred, see the priority below.
+
+**THE MAINTAINER'S STANDING PRIORITY, SET 2026-08-21, AND IT OUTRANKS THE QUEUE BELOW.** CI is
+**deferred** until there is a working, usable version end-to-end. *"Running local tests and local
+actual usage tests should be enough for now, so we can worry about CI after we have a working
+version out."* Do not spend a session on CI flakes, on the `engine` job, or on test-harness
+minutia unless it blocks real usage. The bar for a change is a green **local** run plus actual
+local usage of the thing you changed — and `THE NINTH MECHANISM` still applies to that local run,
+so one green is a data point and not a property. What the maintainer wants is the product working
+on arca, not the suite polished.
+
+**WHAT "WORKING AND USABLE" CONCRETELY MEANS, AND IT IS P5'S SECOND EXIT CLAUSE.** P5's exit is
+*"`gascan-arca` passes conformance and existing `gascan-e2e`"*. P5.3 covered the **first** clause
+and measured it. The **second** — the product-level `gascan-e2e` suite running on arca — is
+untouched, was explicitly out of scope for P5.3, and is the thing standing between here and a
+version someone can actually use. MEASURED 2026-08-21 by `grep -c '#\[ignore'` over
+`crates/gascan-e2e/tests/*.rs`: apple carries **11** ignore attributes (`apple_apply` 8,
+`apple_lifecycle` 1, `apple_recovery` 1, `apple_security` 1) against arca's **3** (`arca_engine` 2,
+`arca_startup` 1). Those are attribute counts, not test counts — re-derive before quoting them, and
+note the P5.3 design's §5 cites 24 and 6 from an earlier revision.
+
+The design named the mechanism for closing that gap: the two `command()` builders,
+`crates/gascan-e2e/tests/apple_common/mod.rs:961` and
+`crates/gascan-e2e/tests/arca_common/mod.rs:303` (both verified present 2026-08-21), *"differ by
+exactly four `.env()` calls"* — re-derive that four, it is the design's number and not mine.
+Parameterising the harness so the apple product tests run against arca is the work.
+
+**One trap that applies to that work and did NOT apply to P5.3**, recorded in the P5.3 design's §6
+so it is not re-imported blindly: the e2e harness selects its backend from the environment and
+`backend_selection` returns `Apple` when nothing is requested — the `(false, false)` arm at
+`crates/gascan-core/src/backend.rs:168`, in the function opening at `:156`. **The design's §6 cites
+`:167` for this and is off by one; `:167` is the `Arca` arm.** Re-derived 2026-08-21. So a dropped
+variable silently tests the **wrong backend** and passes. Conformance was immune because each instantiation constructs its backend in
+code. The product-e2e work is fully exposed to it.
 
 ---
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**P5.3, THE BACKEND CONFORMANCE SUITE, IS EXECUTED — ALL EIGHT TASKS — ON BRANCH
-`feat/backend-conformance-suite`, WHICH IS NOT MERGED.** As of this edit it had no PR — the
-maintainer was holding it for a whole-branch review first. Check with `gh pr list` and re-derive its
-commits with `git log --oneline main..feat/backend-conformance-suite` rather than trusting either
-fact as written here.
+**P5.3, THE BACKEND CONFORMANCE SUITE, IS EXECUTED AND MERGED.** PR #90, merged 2026-08-21 as a
+true merge commit and not a squash: `fe27646`, parents `b0a8ea1` (main) + `ac365a6` (branch), per
+`git log origin/main -1 --format='%h %p %s'`. All 13 commits survive — `git rev-list --count
+b0a8ea1..fe27646` → 14 including the merge — and `git merge-base --is-ancestor` confirms every SHA
+this file and the evidence document cite is reachable from `main`: `f06e96c`, `9dcca6a`, `daa687b`,
+`0e1f3fb`, `049b4ba`, `766eb6e`, `22dfee8`, `9f2c0bf`, `e7e55e4`, `a32a29e`, `ba458c9`, `99f1449`,
+`ac365a6`. That is the point of merging rather than squashing here, because those citations are
+load-bearing. **Re-derive with `git log -1` and `gh pr list` anyway** — this file's own history is
+of going stale within hours.
 
 **THE FINDING, AND IT IS THE POINT OF THE WHOLE EXERCISE: ALL THREE BACKENDS REPORT A DIFFERENT
 STATE AFTER `create`, AND ONLY THE TEST DOUBLE SATISFIES THE CONTRACT.** `FakeRuntime` reports
@@ -50,8 +93,26 @@ a reader arriving from a panic message is not left to guess.
 **NEITHER REAL-BACKEND MEASUREMENT IS REPRODUCIBLE IN CI, and the design used to claim otherwise.**
 CI's live-tier step sets one variable and the tier needs four. `backend_contract_holds_on_arca`
 calls `base_oci_layout()`, whose absence is a `panic!` and never a skip, so it can only join the
-~20 live tests the step's own comment records as failing in 0.00s on that missing variable since
-milestone 2 — that is the derivation, not an observed CI run. Apple's tier runs in **no** CI job at
+live tests the step's own comment records as failing in 0.00s on that missing variable since
+milestone 2.
+
+**That used to be a derivation. It is now an OBSERVED CI run, and this is the upgrade worth
+having.** PR #90's run 32437752256, `engine` job, step *"The live tier, against the engine just
+built"*: `test result: FAILED. 0 passed; 26 failed; 0 ignored; 0 measured; 3 filtered out; finished
+in 0.06s`, every one of them a `required_path` panic. The new test is among them and fails on the
+environment, never reaching a backend:
+
+    thread 'conformance::backend_contract_holds_on_arca' panicked at
+    crates/gascan-arca/tests/live/common/mod.rs:148:48:
+    GASCAN_ARCA_BASE_OCI_LAYOUT must name an OCI layout holding one small linux/arm64 image...
+
+**So a red `engine` job does not reproduce the conformance finding and cannot.** Anyone who reads
+that CI failure as confirming `Creating` vs `Stopped` is reading a missing environment variable.
+Note also that this run got FURTHER than `main`'s recent ones: it passed the Swift step that is red
+on `main` (`THE TENTH MECHANISM`), which makes that mechanism flaky rather than constant. `rust` —
+the only job covering the merged Rust — passed, 6m04s.
+
+Apple's tier runs in **no** CI job at
 all; `.github/workflows/ci.yml` mentions `--ignored` three times and `:178`, arca's step, is the
 only **executed** one. Both results are
 local-only, from `newcombe` on 2026-08-20, and the evidence document is the only record of them
@@ -128,9 +189,11 @@ eleven of its last twelve runs, since before this branch existed.
 insertions, markdown**. There is no code in it. A red `rust` there is a flake, exonerated by diff
 alone. Run `git diff --name-only` before you spend an hour on a red run.
 
-**THE QUEUE BELOW IS WHAT COMES AFTER P5.3.** P5.3's implementation is done and its branch is
-awaiting review; what it *found* is open item 10, which joins this queue rather than blocking it.
-It is a queue, not a menu, and the maintainer chooses from it:
+**THE QUEUE BELOW IS WHAT COMES AFTER P5.3, AND ITS ORDER IS NOW SUBORDINATE TO THE MAINTAINER'S
+2026-08-21 PRIORITY AT THE TOP OF THIS FILE.** P5.3 is merged; what it *found* is open item 10.
+**Item 1 below — the flake mechanisms — is explicitly NOT what to do next.** CI is deferred; a
+session spent on flakes is a session not spent making the product work on arca. The queue is kept
+here because it is real work that will matter later, not because it is next:
 
 1. **The seven unfixed flake mechanisms this file names** — the empty pid-file read, the
    `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
