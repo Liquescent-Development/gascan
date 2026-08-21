@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gascan", "crates/gascan-apple", "crates/gascan-arca", "crates/gascan-core", "crates/gascan-e2e", "crates/gascan-engine-proto", "crates/gascan-inherited-fd", "crates/gascan-oci-fixture", "crates/gascan-proto", "crates/gascand"]
+members = ["crates/gascan", "crates/gascan-apple", "crates/gascan-arca", "crates/gascan-conformance", "crates/gascan-core", "crates/gascan-e2e", "crates/gascan-engine-proto", "crates/gascan-inherited-fd", "crates/gascan-oci-fixture", "crates/gascan-proto", "crates/gascand"]
 resolver = "3"
 
 [workspace.package]

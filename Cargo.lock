@@ -486,6 +486,7 @@ dependencies = [
  "async-trait",
  "base64",
  "camino",
+ "gascan-conformance",
  "gascan-core",
  "libc",
  "rustix",
@@ -502,6 +503,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
+ "gascan-conformance",
  "gascan-core",
  "gascan-engine-proto",
  "gascan-oci-fixture",
@@ -516,6 +518,16 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower 0.4.13",
+]
+
+[[package]]
+name = "gascan-conformance"
+version = "0.1.20"
+dependencies = [
+ "camino",
+ "gascan-core",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

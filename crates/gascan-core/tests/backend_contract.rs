@@ -55,8 +55,14 @@ async fn fake_runtime_records_cancelled_exec_before_terminal_status() {
     assert_eq!(backend.exec_cancellations().await, 1);
 }
 
+/// The stdin/resize/signal half of exec, which needs the fake's own
+/// `fake-echo-stdin` command and its signal-to-exit-code arithmetic.
+///
+/// "the stream ends after the terminal `Exit`" used to be asserted here too and
+/// is now in `gascan_conformance::backend_contract`, which every backend runs;
+/// the name follows the assertions that are left.
 #[tokio::test]
-async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
+async fn exec_session_echoes_stdin_and_maps_a_signal_to_its_exit_code() {
     let backend = FakeRuntime::new(capabilities());
     let fixture = create_request("live-exec");
     let id = fixture.id().clone();
@@ -90,7 +96,6 @@ async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
             signal: 15
         }
     );
-    assert!(session.next().await.is_none());
 }
 
 #[tokio::test]
@@ -144,39 +149,6 @@ async fn persistent_logs_are_isolated_by_exact_sandbox_id() {
         backend.logs(right.id(), None).await.unwrap(),
         b"right-marker"
     );
-}
-
-pub async fn backend_contract(backend: &dyn RuntimeBackend) {
-    let fixture = create_request("contract");
-    let id = fixture.id().clone();
-    assert_eq!(backend.inspect(&id).await.unwrap(), None);
-    let created = backend.create(fixture.request()).await.unwrap();
-    assert!(
-        created
-            .created()
-            .iter()
-            .any(|resource| resource.kind() == ResourceKind::Container)
-    );
-    assert_eq!(
-        backend.inspect(&id).await.unwrap().unwrap().state,
-        gascan_core::runtime::ContainerState::Stopped
-    );
-    backend.start(&id).await.unwrap();
-    let mut session = backend
-        .exec(ExecRequest::fixture(id.clone(), ["true"]))
-        .await
-        .unwrap();
-    session.send(ExecInput::Close).await.unwrap();
-    assert_eq!(
-        session.next().await.unwrap().unwrap(),
-        ExecOutput::Exit { code: 0, signal: 0 }
-    );
-    backend.stop(&id).await.unwrap();
-    backend
-        .remove(RemoveRequest::from_resources(created.created().to_vec()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(backend.inspect(&id).await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -650,32 +622,11 @@ async fn injected_post_mutation_create_failure_reports_partial_resources() {
     assert_eq!(failure.created().len(), 2);
 }
 
-#[tokio::test]
-async fn fake_runtime_satisfies_backend_contract_through_trait_object() {
-    let backend: Box<dyn RuntimeBackend> = Box::new(FakeRuntime::new(capabilities()));
-    backend_contract(backend.as_ref()).await;
-}
-
 #[test]
 fn validated_fixture_keeps_its_canonical_bind_source_alive() {
     let fixture = create_request("live-root");
 
     assert!(fixture.bind_mounts()[0].source.exists());
-}
-
-#[tokio::test]
-async fn duplicate_create_is_rejected_and_start_stop_are_idempotent() {
-    let backend = FakeRuntime::new(capabilities());
-    let fixture = create_request("lifecycle");
-    let id = fixture.id().clone();
-    backend.create(fixture.request()).await.unwrap();
-    let error = backend.create(fixture.request()).await.unwrap_err();
-    assert_eq!(error.code(), "resource_conflict");
-
-    backend.start(&id).await.unwrap();
-    backend.start(&id).await.unwrap();
-    backend.stop(&id).await.unwrap();
-    backend.stop(&id).await.unwrap();
 }
 
 #[tokio::test]

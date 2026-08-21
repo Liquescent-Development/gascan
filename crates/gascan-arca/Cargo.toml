@@ -19,6 +19,7 @@ tower.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
+gascan-conformance = { path = "../gascan-conformance" }
 gascan-oci-fixture.workspace = true
 rustix.workspace = true
 serde_json.workspace = true

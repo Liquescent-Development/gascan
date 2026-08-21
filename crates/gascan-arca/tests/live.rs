@@ -1,5 +1,7 @@
 #[path = "live/common/mod.rs"]
 mod common;
+#[path = "live/conformance.rs"]
+mod conformance;
 #[path = "live/connect.rs"]
 mod connect;
 #[path = "live/exec.rs"]
