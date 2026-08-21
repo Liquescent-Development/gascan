@@ -82,9 +82,23 @@ The fixtures move too. `crates/gascan-core/tests/common/mod.rs` is **61 lines** 
 the contract needs — `capabilities()` (`:27`), `create_request()` (`:40`),
 `create_request_with_network()` (`:44`).
 
+**`common/mod.rs` does not go away, and the duplication with `gascan-conformance` is permanent.**
+Re-derived at HEAD after Task 7: `mod common;` appears in exactly one file,
+`crates/gascan-core/tests/backend_contract.rs:1` — `policy.rs` has its own `capabilities()` at
+`:19` and does not include it — and that one target still calls `capabilities()` on **20** lines,
+`create_request(` on **24** and `create_request_with_network(` on **9**. Every export is still
+referenced, so no task in this plan deletes any of them. The accepted cost is two copies of a
+three-function fixture; the alternative is the one this section already rejected, since pointing
+`gascan-core/tests` at `gascan-conformance` would mint a `gascan-core` dev-dependency on a crate
+that depends on `gascan-core`. Drafts of the task briefs called this duplication "deliberate and
+short-lived" and deferred it to a "Task 9" — the plan has eight tasks, there is no Task 9, and the
+duplication is not short-lived.
+
 ## 3. What gets promoted, and what stays fake-only
 
-`backend_contract.rs` holds **23** `#[tokio::test]` functions. They are not one population.
+`backend_contract.rs` held **23** `#[tokio::test]` functions at `10e3342`. They are not one
+population. (It holds **21** after Task 7: the fake instantiation moved to `gascan-conformance` and
+Task 6 consumed `duplicate_create_is_rejected_and_start_stop_are_idempotent` whole.)
 
 **Promote — assertions any backend must satisfy.** The lifecycle walk already in
 `backend_contract()`, plus `duplicate_create_is_rejected_and_start_stop_are_idempotent`,
@@ -93,10 +107,37 @@ the contract needs — `capabilities()` (`:27`), `create_request()` (`:40`),
 `create_collision_reports_resources_created_before_the_collision`,
 `offline_fake_create_has_no_managed_network`,
 `networked_fake_create_reports_network_then_volumes_then_container`,
-`persistent_logs_are_isolated_by_exact_sandbox_id`. **Estimated 6–8 will promote cleanly**, and the
-estimate is deliberately a range: each one has to be re-read to separate what any backend owes from
-what this double happens to do. **An earlier draft of this analysis said 13. That was wrong** — see
-§4 for the class of error it made.
+`persistent_logs_are_isolated_by_exact_sandbox_id`. Each one had to be re-read to separate what any
+backend owes from what this double happens to do. **An earlier draft of this analysis said 13. That
+was wrong** — see §4 for the class of error it made. **This section then estimated 6–8. That was
+wrong too, and the measured outcome below replaces it** rather than standing beside it.
+
+### Triage outcome, measured across Tasks 6 and 7
+
+**Four assertions promoted, not 6–8.** Counted the other way — by candidate rather than by
+assertion — one of the seven named tests promoted whole, one promoted in part, and five promoted
+nothing. Both countings are below the estimate, and nothing was promoted to close the gap.
+
+| where | what promoted |
+|---|---|
+| Task 6, `22dfee8` | from `duplicate_create_is_rejected_and_start_stop_are_idempotent`: the doubled `start`, the doubled `stop`, and a second `create` of a held id failing with `resource_conflict`. Whole test consumed. |
+| Task 7 | from `exec_session_is_live_bidirectional_and_emits_one_exit`: the exec stream ends at the terminal `Exit`. The rest of that test is fake-only and stays, renamed `exec_session_echoes_stdin_and_maps_a_signal_to_its_exit_code` so the name matches the assertions left in it. |
+
+**Every promoted assertion is exercised by `FakeRuntime` alone today.** Apple and arca both fail the
+contract at the post-`create` state assertion (`crates/gascan-conformance/src/lib.rs:104`) — apple
+reports `Running`, arca `Creating` — which precedes every line promoted, so neither backend has
+been measured against any of it.
+
+**Stays fake-only — the remaining candidates, and the machinery that decided each.**
+
+| test | why it stays |
+|---|---|
+| `exec_and_logs_preserve_binary_bytes_and_exact_exit_code` | `set_exec_result` and `set_logs`, both fake-only. Asserting the property portably needs a command that emits known bytes on stdout *and* stderr and exits non-zero; the fake's vocabulary for that is `fake-stdout` / `fake-stderr` / `fake-exit` (`crates/gascan-core/src/fake_runtime.rs:588-636`), which no container image has, and the fake maps the portable spelling to nothing at all — `Some("true") \| Some("sh") => (Vec::new(), Vec::new(), 0)` at `:633`. Giving the contract a per-backend command means parameterising it, a design change. The exit code the walk *can* portably assert is already asserted. The log half is worse than unportable: `since` is not the same quantity across backends — apple passes `--since {n}ms` to the CLI, a duration ago (`crates/gascan-apple/src/backend.rs:630-632`), arca sends `since_unix_millis`, an absolute instant (`crates/gascan-arca/src/backend.rs:411-414`). |
+| `exec_session_is_live_bidirectional_and_emits_one_exit` | **Promoted in part**, see above. What stays needs `fake-echo-stdin` to get stdin back, and its `Exit { code: 143, signal: 15 }` is the fake's own `128 + signal` arithmetic (`crates/gascan-core/src/fake_runtime.rs:1118-1122`), not something a backend owes. |
+| `create_collision_reports_resources_created_before_the_collision` | `seed_volume`, fake-only. The assertion's entire content is that a failure reports exactly the resources built before a **planted** collision at a chosen index. Creating twice does produce a collision on a real backend, but with the same request — so the reported names would be the live sandbox's own, and what a same-request collision reports is unmeasured on every backend. `crates/gascan-conformance/src/lib.rs:114-123` records that open question in the contract itself. |
+| `offline_fake_create_has_no_managed_network` | Not machinery — fixture shape. The contract is one walk over one fixture, and arca's must be `network = 'networked'`: offline is the capability the pinned engine is proven not to honour (`docs/evidence/2026-08-18-arca-engine-offline.md`). An unconditional "no managed network" assertion fails for a networked fixture on *every* backend, so promoting it needs the contract to branch on the fixture's network. That is a design change, and it is not made here. |
+| `networked_fake_create_reports_network_then_volumes_then_container` | Same fixture-conditionality — the network element exists only for a networked fixture — and, separately, **nothing owes the ordering**. `RemoveRequest::from_resources` does not reorder (`crates/gascan-core/src/runtime.rs:1001-1017`), yet the fake's recorded removal comes out container / volume / network, so re-ordering is the backend's job and no consumer reads `created()` positionally. Arca's list is in whatever order the engine's `CreateResponse` carried (`crates/gascan-arca/src/backend.rs:80-108`) — an unmeasured property of a pinned external binary. **Correction to the plan's candidate table**, which says this ordering "is asserted through the fake's call recorder": it is not. The test reads `outcome.created()` (`crates/gascan-core/tests/backend_contract.rs:509-517`) and touches neither `calls()` nor `outcomes()`. The verdict is unchanged; the stated reason was wrong. |
+| `persistent_logs_are_isolated_by_exact_sandbox_id` | `FakeRuntime::persistent`, named fake-only machinery, plus `fake-stdout` to get a marker into the log. Isolation-by-id also needs two live sandboxes and `backend_contract` takes one fixture, so promoting it would mean a second design change on top of the machinery. |
 
 **Stays fake-only — tests of the double's controllability, not of the contract.**
 `named_failure_is_injected_once_at_the_call_boundary`,
