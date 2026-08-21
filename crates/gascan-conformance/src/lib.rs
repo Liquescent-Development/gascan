@@ -136,6 +136,16 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend, fixture: &CreateRequ
         session.next().await.unwrap().unwrap(),
         ExecOutput::Exit { code: 0, signal: 0 }
     );
+    // `Exit` is terminal: the stream ends there, and every consumer that drains
+    // to completion depends on it -- `gascand/src/service.rs:2336` and
+    // `gascand/src/ssh/manager.rs:700` both loop `while let Some(..) =
+    // session.next().await` and would hang forever against a backend that kept
+    // the stream open. Each backend closes it in its own code: the fake by its
+    // spawned task returning after the `Exit` send
+    // (`gascan-core/src/fake_runtime.rs:1123`), apple by breaking on `terminal`
+    // so the sender drops (`gascan-apple/src/backend.rs:614`), arca by the same
+    // break over engine frames (`gascan-arca/src/backend.rs:387`).
+    assert!(session.next().await.is_none());
     backend.stop(&id).await.unwrap();
     backend.stop(&id).await.unwrap();
     backend

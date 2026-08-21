@@ -55,8 +55,14 @@ async fn fake_runtime_records_cancelled_exec_before_terminal_status() {
     assert_eq!(backend.exec_cancellations().await, 1);
 }
 
+/// The stdin/resize/signal half of exec, which needs the fake's own
+/// `fake-echo-stdin` command and its signal-to-exit-code arithmetic.
+///
+/// "the stream ends after the terminal `Exit`" used to be asserted here too and
+/// is now in `gascan_conformance::backend_contract`, which every backend runs;
+/// the name follows the assertions that are left.
 #[tokio::test]
-async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
+async fn exec_session_echoes_stdin_and_maps_a_signal_to_its_exit_code() {
     let backend = FakeRuntime::new(capabilities());
     let fixture = create_request("live-exec");
     let id = fixture.id().clone();
@@ -90,7 +96,6 @@ async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
             signal: 15
         }
     );
-    assert!(session.next().await.is_none());
 }
 
 #[tokio::test]
