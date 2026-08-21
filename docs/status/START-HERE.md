@@ -7,8 +7,9 @@ Rewritten 2026-08-18 after **MILESTONE 4 MERGED**, and updated the same day afte
 instance record's publish race was fixed and merged (PR #80, #81). Updated again 2026-08-19,
 from branch `fix/daemon-reader-retryable-verdict`, after open item 1's residual — the reader's
 retryable verdict — was implemented there and opened as PR #87. **Updated 2026-08-20: PR #87 is
-merged, open item 1 is closed entire, and the assignment is now P5.3 — the backend conformance
-suite, specced and planned in the block below and not started.** Everything above the `Where the work is` heading is current; everything below it is
+merged, open item 1 is closed entire, and P5.3 — the backend conformance suite — has been
+EXECUTED on branch `feat/backend-conformance-suite`, all eight tasks, and it found two backends
+failing the contract. See the block below and open item 10.** Everything above the `Where the work is` heading is current; everything below it is
 history, **with seven exceptions that are current**: the sections headed `THE FOURTH MECHANISM`
 through `THE TENTH MECHANISM`, which describe live CI flakes — the ninth is about the *local*
 suite, so read it before trusting a green local run, and the tenth (added 2026-08-20) is why
@@ -18,31 +19,44 @@ suite, so read it before trusting a green local run, and the tenth (added 2026-0
 
 ## IF YOU READ NOTHING ELSE, READ THIS BLOCK
 
-**THE ASSIGNMENT IS P5.3, THE BACKEND CONFORMANCE SUITE. IT IS SPECCED, PLANNED, AND NOT STARTED.**
-Chosen by the maintainer on 2026-08-20 after PR #87 merged, on the instruction to follow roadmap
-order. Read these two, in this order, and nothing else is needed to begin:
+**P5.3, THE BACKEND CONFORMANCE SUITE, IS EXECUTED — ALL EIGHT TASKS — ON BRANCH
+`feat/backend-conformance-suite`, WHICH IS NOT MERGED.** As of this edit it had no PR — the
+maintainer was holding it for a whole-branch review first. Check with `gh pr list` and re-derive its
+commits with `git log --oneline main..feat/backend-conformance-suite` rather than trusting either
+fact as written here.
+
+**THE FINDING, AND IT IS THE POINT OF THE WHOLE EXERCISE: ALL THREE BACKENDS REPORT A DIFFERENT
+STATE AFTER `create`, AND ONLY THE TEST DOUBLE SATISFIES THE CONTRACT.** `FakeRuntime` reports
+`Stopped`, apple reports `Running` (its `create` compiles to `container run`), arca reports
+`Creating` (the pinned engine maps status `"created"` → `.creating`). Apple and arca both panic at
+`crates/gascan-conformance/src/lib.rs:104`, the walk's third assertion — so **`start`, `exec`,
+`stop`, `remove` and the closing absent `inspect` were NOT REACHED on either real backend. Do not
+write that apple or arca passed or failed the exec walk; it was not run.**
 
 | | |
 |---|---|
-| Design | `docs/superpowers/specs/2026-08-20-backend-conformance-suite-design.md` |
-| Plan | `docs/superpowers/plans/2026-08-20-backend-conformance-suite.md` — eight tasks, execute with `superpowers:subagent-driven-development` |
+| **The evidence** | `docs/evidence/2026-08-20-backend-conformance.md` — **read this before saying anything about what conformance measured.** Commands, exit codes, host, date, engine revision, the positive control, and what was not reached |
+| Design | `docs/superpowers/specs/2026-08-20-backend-conformance-suite-design.md` — §3 and §6 both carry corrections made after the measurement |
+| Plan | `docs/superpowers/plans/2026-08-20-backend-conformance-suite.md` — the eight tasks as executed |
 
-**The one thing that will mislead you if you skip the design.** The roadmap says *"extract the
-conformance suite from `fake_runtime.rs`"*, which reads as though a suite must be written. It must
-not. `crates/gascan-core/tests/backend_contract.rs:149` is **already**
-`pub async fn backend_contract(backend: &dyn RuntimeBackend)`. It cannot be reached from
-`gascan-apple` or `gascan-arca` because it lives in a `tests/` target, which is not a library —
-which is why `crates/gascan-apple/tests/live/backend_contract.rs` hand-rolls 65 lines over the same
-ground. The task is relocation and instantiation, not authorship.
+**Do not "fix" this by editing the assertion.** Acceptance criterion 8 says arca's result is a
+finding, not a pass criterion; forcing green by widening `lib.rs:104` to accept three states is the
+one outcome that makes the suite worthless. Deciding what a backend owes after `create` is separate
+work and is open item 10.
 
-**The measurement the whole task exists for is Task 5 step 6: run the contract against arca for the
-first time.** The plan deliberately writes no expected result for it. If arca fails, the deliverable
-is the failing test committed with the failure quoted — **not** a weakened assertion. That is
-acceptance criterion 8 in the design, and it is the one that will be under pressure.
+**NEITHER REAL-BACKEND MEASUREMENT IS REPRODUCIBLE IN CI, and the design used to claim otherwise.**
+CI's live-tier step sets one variable and the tier needs four. `backend_contract_holds_on_arca`
+calls `base_oci_layout()`, whose absence is a `panic!` and never a skip, so it can only join the
+~20 live tests the step's own comment records as failing in 0.00s on that missing variable since
+milestone 2 — that is the derivation, not an observed CI run. Apple's tier runs in **no** CI job at
+all; line 178 of `.github/workflows/ci.yml` is the file's only `--ignored`. Both results are
+local-only, from `newcombe` on 2026-08-20, and the evidence document is the only record of them
+that will ever exist. `scripts/ci-check-ignored-tests.sh` proves the tests still exist; it proves
+nothing about their having run.
 
-**What is NOT in it, so nobody widens it mid-flight:** the product-level `gascan-e2e`-on-arca work
-(P5's *second* exit clause), P5.4/U5, and anything about offline. Each is named under the design's
-"Out of scope" with a reason.
+**P5'S EXIT IS NOT MET.** P5.3 covered its *first* clause only — extract the suite, run it against
+apple and arca — and the answer was two failures. The **second** clause, `gascan-e2e` on arca, is
+untouched and was explicitly out of scope, as were P5.4/U5 and anything about offline.
 
 ---
 
@@ -110,8 +124,9 @@ eleven of its last twelve runs, since before this branch existed.
 insertions, markdown**. There is no code in it. A red `rust` there is a flake, exonerated by diff
 alone. Run `git diff --name-only` before you spend an hour on a red run.
 
-**THE QUEUE BELOW IS WHAT COMES AFTER P5.3, NOT INSTEAD OF IT.** It is a queue, not a menu, and
-the maintainer chooses from it once the conformance suite is done:
+**THE QUEUE BELOW IS WHAT COMES AFTER P5.3.** P5.3's implementation is done and its branch is
+awaiting review; what it *found* is open item 10, which joins this queue rather than blocking it.
+It is a queue, not a menu, and the maintainer chooses from it:
 
 1. **The seven unfixed flake mechanisms this file names** — the empty pid-file read, the
    `reconcile` phase matrix that is red on `main` itself, the `lifecycle` ephemeral-port
@@ -684,6 +699,44 @@ unbuilt**: an unstarted implementation with a specified shape, not an open quest
    grounds that a literal in a test outside the implementing crates is the external contract
    rather than a copy. Both judgements were merged on the maintainer's standing merge-on-green
    authorization without a separate review round, and both remain reversible.
+10. **APPLE AND ARCA BOTH FAIL THE BACKEND CONTRACT AT
+    `crates/gascan-conformance/src/lib.rs:104`, AND NOBODY HAS DECIDED WHAT THE RIGHT ANSWER IS.**
+    Opened 2026-08-20 by P5.3. The assertion is
+    `assert_eq!(backend.inspect(&id).await.unwrap().unwrap().state, ContainerState::Stopped)`,
+    immediately after `create`. **All three backends disagree**: `FakeRuntime` `Stopped`, apple
+    `Running`, arca `Creating`. Full record, with commands, exit codes, host, date and engine
+    revision, in **`docs/evidence/2026-08-20-backend-conformance.md`** — read it before saying
+    anything about what conformance measured.
+
+    **Both failures are real, not instrument error.** Apple's `create` compiles to `container run`
+    (`crates/gascan-apple/src/translate.rs:100`), so it has no `Stopped` window at all. Arca's
+    engine, at the pinned revision `c545612b`, maps status `"created"` → `.creating` in a bare
+    `switch` with no clock and no retry (`Sources/ArcaEngine/EngineTranslation.swift:127-134`):
+    `create` performs no autonomous state transition, so waiting longer would not have helped.
+    A positive control — `lifecycle::create_start_inspect_stop_and_remove_drive_a_real_container`,
+    run on the same host and engine **before** the conformance test existed — passed, exit 0.
+
+    **`start`, `exec`, `stop`, `remove` and the closing absent `inspect` were NOT REACHED on either
+    real backend.** They are unmeasured, not passing and not failing.
+
+    **What is open is a design decision, and it has three live candidates**: assert a set of
+    acceptable post-`create` states, make the expected state a fixture-declared fact, or change a
+    backend. **Do not close it by widening `lib.rs:104` to accept whatever the backends do** — that
+    is the outcome the design's acceptance criterion 8 exists to forbid. The two tests stay in the
+    tree failing, on the same principle as `network.rs`'s offline test.
+
+    **Neither result can be reproduced by CI**, so re-measuring means a real Mac with the four
+    `GASCAN_ARCA_*` variables, or `container` running for apple. The reason is in the evidence
+    document and in the design's §6, which was corrected here — it previously claimed the arca
+    instantiation "inherits CI coverage free".
+
+    **A second, smaller thing this branch surfaced and did not answer:** what a *same-request*
+    duplicate `create` reports in `created()` is unmeasured on every backend. A cleanup that
+    assumed it was orphaned residue was written (`9f2c0bf`) and reversed (`e7e55e4`) because it
+    would have torn down the sandbox under test. The nearest precedent a reader will find,
+    `crates/gascan-apple/tests/live/storage.rs:22-37`, is correct *where it is* and must not be
+    copied into the conformance walk. The place to measure it is arca's live tier, mirroring
+    `crates/gascan-arca/tests/live/lifecycle.rs:264` without the preparatory remove.
 
 ### WHAT WAS RUN, AND WHAT CI DOES WITH IT
 

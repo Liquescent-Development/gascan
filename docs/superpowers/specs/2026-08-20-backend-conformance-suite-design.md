@@ -100,7 +100,8 @@ duplication is not short-lived.
 population. (It holds **21** after Task 7: the fake instantiation moved to `gascan-conformance` and
 Task 6 consumed `duplicate_create_is_rejected_and_start_stop_are_idempotent` whole.)
 
-**Promote — assertions any backend must satisfy.** The lifecycle walk already in
+**Candidates considered.** Five of the seven tests named in this paragraph promoted nothing; the
+measured outcome is the table under the next heading, not this list. The lifecycle walk already in
 `backend_contract()`, plus `duplicate_create_is_rejected_and_start_stop_are_idempotent`,
 `exec_and_logs_preserve_binary_bytes_and_exact_exit_code`,
 `exec_session_is_live_bidirectional_and_emits_one_exit`,
@@ -221,13 +222,22 @@ has stopped running."* The same sentence is repeated at `:333-335` on `LiveEngin
 instantiation uses both and inherits the rule.
 
 **Where each instantiation actually runs, which is asymmetric and worth knowing before relying on
-it:** the fake instantiation runs in `cargo test --workspace`, so CI covers it every push. The
-**arca** instantiation lands in the live tier CI already executes —
-`cargo test -p gascan-arca --test live --no-fail-fast -- --ignored`, `.github/workflows/ci.yml:178`
-— so it inherits CI coverage free. The **apple** instantiation runs **nowhere in CI**; no workflow
-step passes `--ignored` for `gascan-apple` or `gascan-e2e`. It is a local, manual tier. This design
-does not change that, and no claim that "apple passes conformance" should be made without saying
-which machine it was run on and when.
+it.** The fake instantiation runs in `cargo test --workspace`, so CI covers it every push. **Neither
+real backend's instantiation is executed by CI in any usable sense — CORRECTING what this section
+said before**, which was that the arca instantiation "inherits CI coverage free". The **arca**
+instantiation does land in the live tier CI executes
+(`cargo test -p gascan-arca --test live --no-fail-fast -- --ignored`,
+`.github/workflows/ci.yml:178`), but that step sets **one** variable, `GASCAN_ARCA_ENGINE_BIN`, and
+the tier needs four. `backend_contract_holds_on_arca` calls `base_oci_layout()`, whose absence is a
+`panic!` and never a skip, and the step's own comment records as a measurement that 20 of the 25
+tests `--ignored` selects fail in 0.00s on exactly that missing variable and have done so since
+milestone 2 — so the new test can only join them. That is a derivation, not an observed CI run.
+The **apple** instantiation runs **nowhere in CI**; no workflow step
+passes `--ignored` for `gascan-apple` or `gascan-e2e`, and line 178 is the only `--ignored` in the
+file. Both real-backend results are therefore local-only, and no claim that a real backend passes or
+fails conformance should be made without naming the machine and the date. What CI *does* hold is
+that the tests are still wired in, via `scripts/ci-check-ignored-tests.sh`; that is existence, not
+execution. `docs/evidence/2026-08-20-backend-conformance.md` is where the local measurements live.
 
 **Proving the extraction is behaviour-preserving.** The fake instantiation must pass before and
 after the move with **no edit to any assertion body**. If an assertion had to change, the move was
