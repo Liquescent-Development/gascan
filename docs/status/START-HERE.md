@@ -34,11 +34,17 @@ on arca, not the suite polished.
 *"`gascan-arca` passes conformance and existing `gascan-e2e`"*. P5.3 covered the **first** clause
 and measured it. The **second** — the product-level `gascan-e2e` suite running on arca — is
 untouched, was explicitly out of scope for P5.3, and is the thing standing between here and a
-version someone can actually use. MEASURED 2026-08-21 by `grep -c '#\[ignore'` over
-`crates/gascan-e2e/tests/*.rs`: apple carries **11** ignore attributes (`apple_apply` 8,
-`apple_lifecycle` 1, `apple_recovery` 1, `apple_security` 1) against arca's **3** (`arca_engine` 2,
-`arca_startup` 1). Those are attribute counts, not test counts — re-derive before quoting them, and
-note the P5.3 design's §5 cites 24 and 6 from an earlier revision.
+version someone can actually use. MEASURED 2026-08-22 by
+`grep -cE '^[[:space:]]*#\[ignore'` over `crates/gascan-e2e/tests/*.rs`: apple carries **11**
+ignore attributes (`apple_apply` 8, `apple_lifecycle` 1, `apple_recovery` 1, `apple_security` 1)
+against arca's **2** (`arca_engine` 2, `arca_startup` 0). Those are attribute counts, not test
+counts — re-derive before quoting them, and note the P5.3 design's §5 cites 24 and 6 from an
+earlier revision.
+
+**Anchor the pattern.** An unanchored `grep -c '#\[ignore'` counts prose: it matches
+`` `#[ignore]`d `` inside `arca_startup.rs`'s `//!` header at `:10`, which is why earlier
+revisions of this file recorded arca as carrying 3. `arca_startup.rs` carries none — every test
+in it runs on every push, which is the point of that file.
 
 The design named the mechanism for closing that gap: the two `command()` builders,
 `crates/gascan-e2e/tests/apple_common/mod.rs:961` and
