@@ -42,7 +42,7 @@ before resuming.** After a context loss, trust it and `git log` over recollectio
 |---|---|
 | **arca-containerization PR #2** | **MERGED** as `a5803b6` on `merge/upstream-main` |
 | **arca PR #60** (design + plan) | open, 9 commits, deliberately held until PR 2 completes |
-| **arca `revert/upstream-rootfs`** | PR 2's branch, 4 commits, **not yet pushed, no PR** |
+| **arca `revert/upstream-rootfs`** | PR 2's branch, 4 commits, pushed to `origin`, **no PR yet** |
 | **gascan PR #92** | open, unchanged by this work |
 
 PR 1 merged as a merge commit, not a squash: `parents=6304122 10f408c`, and all four cited
